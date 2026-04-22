@@ -30,6 +30,10 @@ function updateAllAndTrackChanges() {
     Utilities.sleep(30000);
     console.log(`[대기 완료] 투자의견 업데이트 시작`);
 
+    console.log(`[시작] pre-update opinion snapshot`);
+    Utils.snapshotOpinionsForTracking();
+    console.log(`[완료] pre-update opinion snapshot (${elapsed()})`);
+
     console.log(`[시작] updateInvestmentOpinion`);
     updateInvestmentOpinion();
     console.log(`[완료] 투자의견 업데이트 (${elapsed()})`);

@@ -663,6 +663,9 @@ function processStocks(stockData, marketData, targetSheet, allProperties, outerS
   const entryPriceWrites    = {};
   const entryDateWrites     = {};
   const entryStrategyWrites = {};
+  const latestOpenLogMap    = (typeof Utils !== "undefined" && Utils.getLatestOpenTradingLogEntryMap)
+    ? Utils.getLatestOpenTradingLogEntryMap()
+    : {};
 
   if (nasdaqPeakAlert) console.log("[나스닥 고점 경고] NasdaqPeakSellState=TRUE — ENTRY_ 키 보유 종목 전체 강제 매도 + 신규/재진입 차단");
 
@@ -698,10 +701,52 @@ function processStocks(stockData, marketData, targetSheet, allProperties, outerS
     const rawEntry = allProperties[`ENTRY_${ind.stockName}`];
     const saved    = parseEntryInfo(rawEntry);
     const sellInfo = parseSellInfo(allProperties[`SELL_${ind.stockName}`]);
-    const entryStrategyLabel = (rawEntry && saved.price > 0) ? saved.strategyType : "-";
+    const latestOpenLeg = latestOpenLogMap[ind.stockName] || null;
+    const entryStrategyLabel = latestOpenLeg
+      ? latestOpenLeg.strategyType
+      : ((rawEntry && saved.price > 0) ? saved.strategyType : "-");
     console.log(`[ENTRY_키] ${ind.displayName} — price: ${saved.price}, date: ${saved.date ? Utilities.formatDate(saved.date, "Asia/Seoul", "yyyy-MM-dd") : "null"}, strategy: ${entryStrategyLabel}`);
 
-    if (saved.price > 0) {
+    if (latestOpenLeg) {
+      const latestDateStr = Utilities.formatDate(latestOpenLeg.buyDate, "Asia/Seoul", "yyyy-MM-dd");
+      const savedDateStr  = saved.date ? Utilities.formatDate(saved.date, "Asia/Seoul", "yyyy-MM-dd") : "";
+      const entryMismatch = saved.price !== latestOpenLeg.buyPrice
+        || savedDateStr !== latestDateStr
+        || saved.strategyType !== latestOpenLeg.strategyType;
+
+      if (entryMismatch) {
+        saveEntryInfo(ind.stockName, latestOpenLeg.buyPrice, latestOpenLeg.buyDate, latestOpenLeg.strategyType);
+        saved.price = latestOpenLeg.buyPrice;
+        saved.date  = latestOpenLeg.buyDate;
+        saved.strategyType = latestOpenLeg.strategyType;
+        console.log(` → [트레이딩로그 기준 동기화] ${ind.displayName}: 최신 미청산 ${fmtPrice(latestOpenLeg.buyPrice, ind.stockName)} / ${latestDateStr} / ${strategyDisplayName(latestOpenLeg.strategyType)}`);
+      }
+
+      ind.entryPrice = latestOpenLeg.buyPrice;
+      ind.entryDate  = latestOpenLeg.buyDate;
+
+      const sheetPrice    = Number(row[C.entryPrice]) || 0;
+      const sheetDateRaw  = row[C.entryDate];
+      const sheetDateStr  = sheetDateRaw instanceof Date
+        ? Utilities.formatDate(sheetDateRaw, "Asia/Seoul", "yyyy-MM-dd")
+        : (typeof sheetDateRaw === "string" ? sheetDateRaw.trim() : "");
+      const sheetStratCode = parseStrategyCode(row[C.entryStrategy]);
+
+      if (sheetPrice !== latestOpenLeg.buyPrice) {
+        entryPriceWrites[i + 3] = latestOpenLeg.buyPrice;
+        console.log(` → [진입가 동기화] ${ind.displayName}: 시트 ${fmtPrice(sheetPrice, ind.stockName)} → 로그 ${fmtPrice(latestOpenLeg.buyPrice, ind.stockName)}`);
+      }
+      if (sheetDateStr !== latestDateStr) {
+        entryDateWrites[i + 3] = latestDateStr;
+        console.log(` → [진입일 동기화] ${ind.displayName}: 시트 "${sheetDateStr}" → 로그 "${latestDateStr}"`);
+      }
+      if (sheetStratCode !== latestOpenLeg.strategyType) {
+        entryStrategyWrites[i + 3] = strategyDisplayName(latestOpenLeg.strategyType);
+        console.log(` → [전략 동기화] ${ind.displayName}: 시트 "${sheetStratCode || "없음"}" → 로그 "${strategyDisplayName(latestOpenLeg.strategyType)}"`);
+      }
+    }
+
+    if (!latestOpenLeg && saved.price > 0) {
       // ENTRY_ 키가 source of truth — 시트와 불일치하면 ENTRY_ 키 값으로 덮어씀
       ind.entryPrice = saved.price;
       ind.entryDate  = saved.date;
@@ -734,7 +779,7 @@ function processStocks(stockData, marketData, targetSheet, allProperties, outerS
     // 시트에 진입가/진입일이 있는데 ENTRY_ 키가 없는 경우 → 키 유실로 판단
     // 매수/관망: 아직 포지션 보유 중일 가능성 → 복구 대상
     // 매도: 청산 후 시트 정리가 안 된 레거시 데이터일 가능성 → 복구 제외
-    const entryKeyLost = saved.price <= 0 && ind.entryPrice > 0 && ind.entryDate
+    const entryKeyLost = !latestOpenLeg && saved.price <= 0 && ind.entryPrice > 0 && ind.entryDate
                       && (ind.opinion === "매수" || ind.opinion === "관망");
     if (entryKeyLost) {
       saved.price = ind.entryPrice;

@@ -117,9 +117,11 @@ function processMultiSlots(stockName, row, globalData, now, allProperties, kstDa
   const C           = Utils.COL_INDICES;
   const S           = Utils.STRATEGY;
   const displayName = Utils.getDisplayName(stockName, row);
+  const currentOpinion = String(row[C.opinion] || "").trim();
   const price       = Number(row[C.currentPrice]) || 0;
   const fmtP        = Utils.fmtPrice(price, stockName);
   if (!price) return;
+  if (currentOpinion === "매도") return;
 
   // 주 전략 식별 (중복 방지)
   const primaryEntry    = Utils.loadEntryInfoFrom(stockName, allProperties);
@@ -148,27 +150,8 @@ function processMultiSlots(stockName, row, globalData, now, allProperties, kstDa
     const isOccupied = slot !== null;
 
     if (isOccupied) {
-      // ── 슬롯 청산 조건 체크 (활성 슬롯이면 주 전략 여부와 무관하게 항상 체크) ──
-      const exitResult = Utils.evaluateSlotExit(row, globalData, now, slot, strategy, allProperties);
-      if (!exitResult) continue;
-
-      const returnPct  = ((price - slot.price) / slot.price * 100).toFixed(2);
-      const entryNote  = `진입가 ${Utils.fmtPrice(slot.price, stockName)} · 수익률 ${Number(returnPct) >= 0 ? "+" : ""}${returnPct}%`;
-
-      changes.push({
-        stock: displayName, ticker: stockName,
-        from:  `${stratShortLabel(strategy)} 보유중`,
-        to:    "매도",
-        reason: exitResult.reason, price: fmtP, entryNote, stopLoss: ""
-      });
-
-      Utils.recordSlotSellSignal(stockName, strategy, kstDate, price);
-      Utils.clearSlot(stockName, strategy, props);
-      // 슬롯 재진입 쿨다운 기록
-      const dateStr = typeof kstDate === "string" ? kstDate : Utilities.formatDate(kstDate, "Asia/Seoul", "yyyy-MM-dd");
-      props.setProperty(`SLOT_SELL_${stockName}_${strategy}`, `${dateStr}|${price}`);
-      console.log(`[슬롯 매도] ${displayName} ${strategy}그룹: ${exitResult.reason}`);
-
+      // 최신 미청산 레그의 EXIT가 종목 전체 청산을 결정하므로
+      // 활성 슬롯 자체는 독립 청산하지 않고 전역 매도 시점까지 유지한다.
     } else {
       // ── 슬롯 신규 진입 조건 체크 ─────────────────────────────────────────
       // 주 전략 포지션이 없는 순수 관망 종목은 기존 handleOpinionChange 경로로 처리
@@ -209,6 +192,7 @@ function processMultiSlots(stockName, row, globalData, now, allProperties, kstDa
 
       Utils.saveSlot(stockName, strategy, price, dateStr, props);
       Utils.recordBuySignal(stockName, dateStr, price, label);
+      Utils.syncEntryRepresentativeFromTradingLog(stockName, props);
       console.log(`[슬롯 매수] ${displayName} ${strategy}그룹 병행 진입: ${reason}`);
     }
   }
@@ -268,6 +252,7 @@ function handleOpinionChange(stockName, fromOpinion, toOpinion, row, currentGlob
       entryNote = `진입가 ${Utils.fmtPrice(saved.price, stockName)} (${entryDateStr}) · 수익률 ${Number(returnPct) >= 0 ? "+" : ""}${returnPct}%`;
     }
     props.setProperty(`SOLD_FLAG_${stockName}`, "true");
+    Utils.clearAllSlotStateForStock(stockName, price, kstDate, props, allProperties);
     console.log(`[SOLD_FLAG 세팅] ${displayName}`);
   }
 
@@ -303,21 +288,11 @@ function handleOpinionChange(stockName, fromOpinion, toOpinion, row, currentGlob
         console.log(`[경고] ${displayName}: 매수 신호 기록 시 전략 타입 미결정 — 레이블 없이 기록`);
       }
       Utils.recordBuySignal(stockName, kstDate, price, resolvedBuyStrategy ? strategyDisplayName(resolvedBuyStrategy) : "");
+      Utils.syncEntryRepresentativeFromTradingLog(stockName, props);
     }
   }
   if (toOpinion === "매도" && fromOpinion !== "매도") {
-    // 전략 코드 우선순위: evaluatedStrategyType → 시트 BC열(entryStrategy) → ENTRY_ 키
-    let finalStrategyType = evaluatedStrategyType;
-    if (!finalStrategyType) {
-      const sheetStratStr = String(row[Utils.COL_INDICES.entryStrategy] || "").trim();
-      if (sheetStratStr) finalStrategyType = sheetStratStr.charAt(0).toUpperCase();
-    }
-    if (!finalStrategyType) {
-      const saved = Utils.loadEntryInfoFrom(stockName, allProperties);
-      if (saved.price > 0 && saved.strategyType) finalStrategyType = saved.strategyType;
-    }
-    const sellLabel = finalStrategyType ? strategyDisplayName(finalStrategyType) : null;
-    Utils.recordSellSignal(stockName, kstDate, price, sellLabel);
+    Utils.recordAllOpenSellSignals(stockName, kstDate, price);
   }
 
   updatedOpinions[stockName] = { opinion: toOpinion, reason: Utils.summarizeChangeReason(toOpinion, toOpinion, currentGlobalData, lastEvent, row, now, reason, allProperties) };
@@ -1329,6 +1304,127 @@ const Utils = {
     return lastRow + 1;
   },
 
+  parseTradingLogStrategyCode(label) {
+    const text = String(label || "").trim();
+    const match = text.match(/^([A-F])\s*\./i) || text.match(/^([A-F])$/i);
+    return match ? match[1].toUpperCase() : null;
+  },
+
+  getOpenTradingLogEntries(logSheet) {
+    const targetSheet = logSheet || Utils.getTradingLogSheet();
+    if (!targetSheet) return [];
+    const lastRow = targetSheet.getLastRow();
+    if (lastRow < 3) return [];
+
+    const data = targetSheet.getRange(3, 1, lastRow - 2, 6).getValues();
+    const entries = [];
+    for (let i = 0; i < data.length; i++) {
+      const row = data[i];
+      const stockName = String(row[0] || "").trim();
+      const buyDateRaw = row[1];
+      const buyPrice = Utils.parseTradingLogPriceInput(row[2]);
+      const sellDateRaw = row[3];
+      const strategyLabel = String(row[5] || "").trim();
+      const strategyType = Utils.parseTradingLogStrategyCode(strategyLabel);
+      if (!stockName || !buyDateRaw || buyPrice === null || buyPrice <= 0 || sellDateRaw) continue;
+
+      const buyDate = buyDateRaw instanceof Date ? buyDateRaw : Utils.parseDateKST(buyDateRaw);
+      if (!buyDate || isNaN(buyDate.getTime()) || !strategyType) continue;
+
+      entries.push({
+        stockName,
+        buyDate,
+        buyDateString: Utilities.formatDate(buyDate, "Asia/Seoul", "yyyy-MM-dd"),
+        buyPrice,
+        strategyType,
+        strategyLabel: strategyLabel || strategyDisplayName(strategyType),
+        rowNumber: i + 3
+      });
+    }
+    return entries;
+  },
+
+  getLatestOpenTradingLogEntryMap(logEntries) {
+    const entries = logEntries || Utils.getOpenTradingLogEntries();
+    const latestByStock = {};
+    entries.forEach(entry => {
+      const current = latestByStock[entry.stockName];
+      if (!current) {
+        latestByStock[entry.stockName] = entry;
+        return;
+      }
+      if (entry.buyDate.getTime() > current.buyDate.getTime() || entry.rowNumber > current.rowNumber) {
+        latestByStock[entry.stockName] = entry;
+      }
+    });
+    return latestByStock;
+  },
+
+  getLatestOpenTradingLogEntry(stockName, logEntries) {
+    const latestByStock = Utils.getLatestOpenTradingLogEntryMap(logEntries);
+    return latestByStock[stockName] || null;
+  },
+
+  syncEntryRepresentativeFromTradingLog(stockName, props) {
+    const latestOpen = Utils.getLatestOpenTradingLogEntry(stockName);
+    if (!latestOpen) return null;
+    const properties = props || PropertiesService.getScriptProperties();
+    properties.deleteProperty(`HOLD_ANCHOR_${stockName}`);
+    properties.deleteProperty(`HOLD_WATCH_${stockName}`);
+    properties.deleteProperty(`A_HOLD_ANCHOR_${stockName}`);
+    properties.deleteProperty(`A_HOLD_WATCH_${stockName}`);
+    properties.deleteProperty(`UPPER_EXIT_ARM_${stockName}`);
+    const value = `${latestOpen.buyPrice}|${Utilities.formatDate(latestOpen.buyDate, "Asia/Seoul", "yyyy-MM-dd'T'HH:mm:ss")}+09:00|${latestOpen.strategyType}`;
+    properties.setProperty(`ENTRY_${stockName}`, value);
+    return latestOpen;
+  },
+
+  clearAllSlotStateForStock(stockName, sellPrice, sellDate, props, allProperties) {
+    const properties = props || PropertiesService.getScriptProperties();
+    const snapshot = allProperties || properties.getProperties();
+    const prefixes = [
+      `SLOT_${stockName}_`,
+      `SLOT_UPPER_EXIT_ARM_${stockName}_`
+    ];
+    const slotKeys = Object.keys(snapshot).filter(key => key.indexOf(`SLOT_${stockName}_`) === 0 && key.indexOf(`SLOT_SELL_${stockName}_`) !== 0 && key.indexOf(`SLOT_UPPER_EXIT_ARM_${stockName}_`) !== 0);
+    slotKeys.forEach(key => {
+      const strategy = key.substring((`SLOT_${stockName}_`).length);
+      properties.deleteProperty(key);
+      properties.deleteProperty(`SLOT_UPPER_EXIT_ARM_${stockName}_${strategy}`);
+      if (sellDate) {
+        const dateStr = sellDate instanceof Date
+          ? Utilities.formatDate(sellDate, "Asia/Seoul", "yyyy-MM-dd")
+          : String(sellDate);
+        properties.setProperty(`SLOT_SELL_${stockName}_${strategy}`, `${dateStr}|${sellPrice}`);
+      }
+    });
+    Object.keys(snapshot)
+      .filter(key => prefixes.some(prefix => key.indexOf(prefix) === 0) && slotKeys.indexOf(key) === -1)
+      .forEach(key => properties.deleteProperty(key));
+  },
+
+  recordAllOpenSellSignals(stockName, sellDate, sellPrice) {
+    const logSheet = Utils.getTradingLogSheet();
+    if (!logSheet) { console.log(`[로깅 실패] ${stockName}: 시트 없음`); return 0; }
+    const lastRow = logSheet.getLastRow();
+    if (lastRow < 3) return 0;
+    const data = logSheet.getRange(3, 1, lastRow - 2, 6).getValues();
+    let updateCount = 0;
+    for (let i = 0; i < data.length; i++) {
+      if (String(data[i][0]).trim() !== stockName || data[i][3]) continue;
+      try {
+        logSheet.getRange(i + 3, 4).setValue(sellDate);
+        Utils.setTradingLogPriceCell(logSheet.getRange(i + 3, 5), stockName, sellPrice);
+        updateCount++;
+        console.log(`[로깅] 일괄 매도: ${stockName} ${Utils.fmtPrice(sellPrice, stockName)} 행:${i + 3}`);
+      } catch (e) {
+        console.log(`[로깅 실패] ${stockName} 행${i + 3}: ${e}`);
+      }
+    }
+    if (updateCount === 0) console.log(`[로깅 건너띔] ${stockName}: 청산할 매수 기록 없음`);
+    return updateCount;
+  },
+
   // ── 멀티 슬롯 관리 ─────────────────────────────────────────────────────────
   // SLOT_${stockName}_${strategy}: "price|dateStr"
   // SLOT_SELL_${stockName}_${strategy}: "dateStr|sellPrice"
@@ -1672,177 +1768,10 @@ const Utils = {
 };
 
 /**
- * 트레이딩 로그에서 특정 종목+전략의 잘못 입력된 매도 데이터를 삭제합니다.
- * 실행 후 이 함수를 제거하거나 주석 처리하세요.
- * 
- * 사용법: 아래 호출부를 수정하여 stockName, strategyCode를 지정합니다.
- *   fixTradingLogSellData("247540", "C")
+ * 과거 TE/ONDS 한정 보정 함수명과의 호환용 래퍼입니다.
+ * 이제는 전 종목 기준 동기화를 수행합니다.
  */
-function fixTradingLogSellData(stockName, strategyCode) {
-  if (!stockName || !strategyCode) {
-    console.log("[복구 실패] stockName과 strategyCode를 인수로 전달하세요.");
-    return;
-  }
-  const logSheet = Utils.getTradingLogSheet();
-  if (!logSheet) { console.log("[복구 실패] 트레이딩 로그 시트를 찾을 수 없습니다."); return; }
-
-  const lastRow = logSheet.getLastRow();
-  if (lastRow < 3) { console.log("[복구] 데이터 없음"); return; }
-
-  const data = logSheet.getRange(3, 1, lastRow - 2, 6).getValues();
-  const normalizeLabel = (l) => String(l || "").replace(/^[A-F]\.\s*/, "").trim();
-  const targetLabel = Utils.getDisplayName
-    ? strategyCode
-    : strategyCode;
-
-  // 전략 라벨 매칭 문자열 (예: "스퀴즈 거래량 돌파")
-  const strategyNames = {
-    A: "모멘텀 재가속",
-    B: "공황 저점",
-    C: "스퀴즈 거래량 돌파",
-    D: "상승 흐름 강화",
-    E: "스퀴즈 저점",
-    F: "BB 극단 저점"
-  };
-  const targetLabelNorm = strategyNames[strategyCode.toUpperCase()] || strategyCode;
-
-  let fixCount = 0;
-  for (let i = 0; i < data.length; i++) {
-    const ticker   = String(data[i][0]).trim();
-    const sellDate = data[i][3];
-    const logLabel = String(data[i][5] || "");
-    if (ticker !== stockName) continue;
-    if (!sellDate) continue; // 매도 기록 없는 행은 스킵
-    if (normalizeLabel(logLabel) !== targetLabelNorm) continue; // 전략 불일치는 스킵
-
-    // 매도 날짜(D열=4)와 매도 가격(E열=5) 삭제
-    logSheet.getRange(i + 3, 4).clearContent();
-    logSheet.getRange(i + 3, 5).clearContent();
-    fixCount++;
-    console.log(`[복구 완료] ${stockName} ${strategyCode}그룹 → 행 ${i + 3} 매도 데이터 삭제`);
-  }
-
-  if (fixCount === 0) {
-    console.log(`[복구] ${stockName} ${strategyCode}그룹: 정정할 매도 기록 없음 (이미 정상 상태거나 해당 행 없음)`);
-  } else {
-    console.log(`[복구 완료] 총 ${fixCount}건 정정됨`);
-  }
-
-  // SLOT_ 키 상태 확인
-  const props    = PropertiesService.getScriptProperties();
-  const slotKey  = `SLOT_${stockName}_${strategyCode.toUpperCase()}`;
-  const slotVal  = props.getProperty(slotKey);
-  if (slotVal) {
-    console.log(`[SLOT 확인] ${slotKey} = ${slotVal} (포지션 키 존재 - 정상)`);
-  } else {
-    console.log(`[SLOT 확인] ${slotKey} 없음 (포지션이 실제로 없거나 이미 삭제됨)`);
-  }
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// 트레이딩 로그 전략 레이블 수정: ASTS F→D 오기록 정정
-// 실행 후 이 함수를 삭제하거나 주석 처리하세요.
-// ──────────────────────────────────────────────────────────────────────────────
-/**
- * ASTS 트레이딩 로그에서 F 전략으로 잘못 기록된 매수 행의 전략 레이블을 D로 수정합니다.
- * evaluatedStrategyType || "F" 버그로 인해 발생한 오기록입니다.
- */
-function fixASTSStrategyLabel() {
-  const logSheet = Utils.getTradingLogSheet();
-  if (!logSheet) { console.log("[복구 실패] 트레이딩 로그 시트를 찾을 수 없습니다."); return; }
-
-  const lastRow = logSheet.getLastRow();
-  if (lastRow < 3) { console.log("[복구] 데이터 없음"); return; }
-
-  const data = logSheet.getRange(3, 1, lastRow - 2, 6).getValues();
-  const normalizeLabel = (l) => String(l || "").replace(/^[A-F]\.\s*/, "").trim();
-  const wrongLabel  = "BB 극단 저점"; // F 전략 레이블
-  const correctLabel = "D. 200일선 상방 & 상승 흐름 강화";
-
-  let fixCount = 0;
-  for (let i = 0; i < data.length; i++) {
-    const ticker = String(data[i][0]).trim();
-    if (ticker !== "ASTS") continue;
-    if (data[i][3]) continue; // 이미 매도 처리된 행은 스킵
-
-    const currentLabel = String(data[i][5] || "");
-    if (normalizeLabel(currentLabel) !== wrongLabel) continue;
-
-    logSheet.getRange(i + 3, 6).setValue(correctLabel);
-    fixCount++;
-    console.log(`[수정 완료] ASTS 행 ${i + 3}: 전략 레이블 "${currentLabel}" → "${correctLabel}"`);
-  }
-
-  if (fixCount === 0) {
-    console.log("[수정] ASTS: 수정할 F 전략 레이블 없음 (이미 정상이거나 해당 행 없음)");
-  } else {
-    console.log(`[수정 완료] ASTS 총 ${fixCount}건 정정됨`);
-  }
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// LIG디펜스 D전략 포지션 미청산 수정
-// 실행 후 이 함수를 삭제하거나 주석 처리하세요.
-// ──────────────────────────────────────────────────────────────────────────────
-/**
- * LIG디펜스(079550) 트레이딩 로그에서 D전략으로 열려 있는 행을 닫고 (매도 데이터 기입),
- * A전략 매수 행이 없으면 새로 추가합니다.
- *
- * 사용 전에 아래 상수를 실제 값으로 확인/수정하세요:
- *   D_SELL_DATE  : D포지션 청산일 (A전략 진입일 = "2026-04-22")
- *   D_SELL_PRICE : D포지션 청산 가격 (A전략 진입 시점의 LIG 가격, 실제 확인 필요)
- *   A_BUY_DATE   : A전략 매수일
- *   A_BUY_PRICE  : A전략 매수 가격 (ENTRY_ 키 기준 1005000)
- */
-function fixLIGDipensTradingLog() {
-  const STOCK_NAME  = "079550";
-  const D_SELL_DATE = "2026-04-22";   // D포지션 청산일 (A전략 시작일)
-  const D_SELL_PRICE = 1005000;       // D포지션 청산가 (A전략 진입가로 대체)
-  const A_BUY_DATE  = "2026-04-22";
-  const A_BUY_PRICE = 1005000;
-  const A_LABEL     = "A. 200일선 상방 & 모멘텀 재가속";
-  const D_LABEL_NORM = "상승 흐름 강화";
-
-  const logSheet = Utils.getTradingLogSheet();
-  if (!logSheet) { console.log("[복구 실패] 시트를 찾을 수 없습니다."); return; }
-
-  const lastRow = logSheet.getLastRow();
-  if (lastRow < 3) { console.log("[복구] 데이터 없음"); return; }
-
-  const data = logSheet.getRange(3, 1, lastRow - 2, 6).getValues();
-  const normalizeLabel = (l) => String(l || "").replace(/^[A-F]\.\s*/, "").trim();
-
-  // ① D전략 미청산 행 찾아서 청산 처리
-  let dRowFixed = 0;
-  for (let i = 0; i < data.length; i++) {
-    const ticker = String(data[i][0]).trim();
-    if (ticker !== STOCK_NAME) continue;
-    if (data[i][3]) continue; // 이미 매도 있는 행 스킵
-    if (normalizeLabel(String(data[i][5] || "")) !== D_LABEL_NORM) continue;
-
-    logSheet.getRange(i + 3, 4).setValue(D_SELL_DATE);
-    Utils.setTradingLogPriceCell(logSheet.getRange(i + 3, 5), STOCK_NAME, D_SELL_PRICE);
-    dRowFixed++;
-    console.log(`[D청산 완료] LIG디펜스 행 ${i + 3}: 매도일 ${D_SELL_DATE}, 매도가 ₩${D_SELL_PRICE.toLocaleString()} 기입`);
-  }
-  if (dRowFixed === 0) console.log("[D청산] LIG디펜스 D전략 미청산 행 없음 (이미 처리됐거나 없음)");
-
-  // ② A전략 매수 행이 이미 있는지 확인
-  const latestData = logSheet.getRange(3, 1, logSheet.getLastRow() - 2, 6).getValues();
-  const A_LABEL_NORM = "모멘텀 재가속";
-  const aRowExists = latestData.some(r =>
-    String(r[0]).trim() === STOCK_NAME
-    && !r[3]
-    && normalizeLabel(String(r[5] || "")) === A_LABEL_NORM
-  );
-
-  if (aRowExists) {
-    console.log("[A매수] LIG디펜스 A전략 매수 행 이미 존재 — 추가 생략");
-  } else {
-    const newRow = Utils.getNextTradingLogRow(logSheet);
-    logSheet.getRange(newRow, 1, 1, 6).setValues([[STOCK_NAME, A_BUY_DATE, "", "", "", A_LABEL]]);
-    Utils.setTradingLogPriceCell(logSheet.getRange(newRow, 3), STOCK_NAME, A_BUY_PRICE);
-    SpreadsheetApp.flush();
-    console.log(`[A매수 추가] LIG디펜스 A전략 행 ${newRow}: 매수일 ${A_BUY_DATE}, 매수가 ₩${A_BUY_PRICE.toLocaleString()} 기입`);
-  }
+function reconcileTeAndOndsTradingLogFromCurrentState() {
+  console.log("[안내] TE/ONDS 전용 보정은 폐기되었고, 전 종목 동기화를 실행합니다.");
+  applyTradingLogSyncFromCurrentSystem();
 }
