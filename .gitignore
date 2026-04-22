@@ -1,0 +1,15 @@
+# 데이터 파일 (용량 크고 코드 아님)
+*.csv
+*.png
+
+# Python 캐시
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
+
+# 환경설정
+.env
+*.key

@@ -1,0 +1,1848 @@
+function trackChanges() {
+  const startTime = Date.now();
+  console.log("========== 투자의견 추적 시작 ==========");
+
+  const { sheet, targetSheet } = Utils.getSheets("기술분석");
+  if (!targetSheet) { console.log("[단계1 실패] 스프레드시트 접근 실패"); return; }
+
+  const now = new Date();
+  const { kstDate, kstDateOnly, kstHour, kstMinute, estString } = Utils.getTimeDetails(now);
+  const props             = PropertiesService.getScriptProperties();
+  const allProperties     = props.getProperties();
+  const currentGlobalData = Utils.getGlobalData(targetSheet, allProperties);
+  const lastValues        = Utils.getLastValues();
+  let currentValidOpinions = { ...lastValues.lastValidOpinions };
+
+  console.log(
+    `[글로벌] 이벤트: "${currentGlobalData.event}", VIX: ${currentGlobalData.vixToday}, IXIC 이격도: ${currentGlobalData.ixicDist.toFixed(2)}%, ` +
+    `하락장 필터(A/C/D/E/F, 히스테리시스): ${currentGlobalData.ixicFilterActive ? "예" : "아니오"}`
+  );
+
+  if (Utils.isInitialRun(lastValues, targetSheet, currentGlobalData)) { console.log("[초기 실행 감지] 종료"); return; }
+
+  const currentData   = targetSheet.getRange(3, 1, targetSheet.getLastRow() - 2, targetSheet.getLastColumn()).getValues();
+  const trendData     = Utils.getLatestTrendData(targetSheet);
+  const industryMap   = Utils.buildIndustryMap(targetSheet);
+
+  const { changes, buyOpinions, sellOpinions, updatedOpinions } = processData(
+    currentData, currentGlobalData, lastValues.event, currentValidOpinions,
+    { kstDate: kstDateOnly, kstHour, kstMinute, now }, allProperties, props
+  );
+
+  changes.forEach(c => {
+    c.industry   = industryMap[c.ticker] || null;
+    c.trendBadge = (c.to === "매수" && c.industry && trendData) ? Utils.buildTrendBadge(c.industry, trendData) : null;
+  });
+
+  console.log(`[분석 완료] 변경: ${changes.length}건, 현재 매수 의견: ${buyOpinions.length}개(${buyOpinions.length > 0 ? buyOpinions.join(", ") : "없음"}), 현재 매도 의견: ${sellOpinions.length}개(${sellOpinions.length > 0 ? sellOpinions.join(", ") : "없음"})`);
+  if (changes.length > 0) Utils.sendEmailAlert(targetSheet.getRange("F1").getValue(), changes, buyOpinions, sellOpinions, kstDate, estString);
+
+  Utils.saveLastValues(currentData, updatedOpinions, currentGlobalData);
+  console.log(`[완료] ${((Date.now() - startTime) / 1000).toFixed(1)}초`);
+  console.log("========== 투자의견 추적 종료 ==========");
+}
+
+function normalizeTradingLogPriceFormats() {
+  console.log("========== 트레이딩로그 가격 서식 정리 시작 ==========");
+
+  const logSheet = Utils.getTradingLogSheet();
+  if (!logSheet) { console.log("[실패] 트레이딩로그 시트 없음"); return; }
+
+  const lastRow = logSheet.getLastRow();
+  if (lastRow < 3) {
+    console.log("[완료] 정리할 데이터 없음");
+    console.log("========== 트레이딩로그 가격 서식 정리 종료 ==========");
+    return;
+  }
+
+  const data = logSheet.getRange(3, 1, lastRow - 2, 5).getValues();
+  let buyUpdatedCount  = 0;
+  let sellUpdatedCount = 0;
+
+  data.forEach((row, index) => {
+    const stockName = String(row[0] || "").trim();
+    if (!stockName) return;
+
+    const sheetRow = index + 3;
+    if (Utils.normalizeTradingLogPriceCell(logSheet.getRange(sheetRow, 3), stockName, row[2])) buyUpdatedCount++;
+    if (Utils.normalizeTradingLogPriceCell(logSheet.getRange(sheetRow, 5), stockName, row[4])) sellUpdatedCount++;
+  });
+
+  console.log(`[완료] 매수 가격 ${buyUpdatedCount}건, 매도 가격 ${sellUpdatedCount}건 서식 정리`);
+  console.log("========== 트레이딩로그 가격 서식 정리 종료 ==========");
+}
+
+function processData(currentData, currentGlobalData, lastEvent, currentValidOpinions, timeDetails, allProperties, props) {
+  const { kstDate, now } = timeDetails;
+  const changes          = [];
+  const buyOpinions      = [];
+  const sellOpinions     = [];
+  const updatedOpinions  = { ...currentValidOpinions };
+
+  currentData.forEach((row) => {
+    const C         = Utils.COL_INDICES;
+    const stockName = String(row[C.stockName]).trim();
+    if (!stockName || row.length < 54) return;
+
+    const currentOpinion = String(row[C.opinion]).trim();
+    const displayName    = Utils.getDisplayName(stockName, row);
+    if (currentOpinion === "매수") buyOpinions.push(displayName);
+    if (currentOpinion === "매도") sellOpinions.push(displayName);
+
+    if (!Utils.toNum(row[C.currentPrice]) || !Utils.toNum(row[C.ma200])) { console.log(`[SKIP] ${displayName} — 데이터 오류`); return; }
+
+    const lastOpinionData = updatedOpinions[stockName] || { opinion: "초기값", reason: "초기값 설정" };
+    const lastOpinion     = lastOpinionData.opinion;
+    const lastReason      = lastOpinionData.reason;
+    const evaluated       = Utils.evaluateOpinion(row, currentGlobalData, now, allProperties);
+
+    if (currentOpinion !== lastOpinion) {
+      handleOpinionChange(stockName, lastOpinion, currentOpinion, row, currentGlobalData, lastEvent, kstDate, lastReason, changes, updatedOpinions, now, evaluated.reason, evaluated.strategyType, allProperties, props);
+    } else if (Utils.isValidOpinion(currentOpinion)) {
+      updatedOpinions[stockName] = { opinion: currentOpinion, reason: Utils.summarizeChangeReason(currentOpinion, currentOpinion, currentGlobalData, lastEvent, row, now, lastReason, allProperties) };
+    }
+
+    // 멀티 슬롯: 보유 중에도 다른 전략 조건 독립 평가 (별도 진입/청산)
+    processMultiSlots(stockName, row, currentGlobalData, now, allProperties, kstDate, changes, props);
+  });
+
+  return { changes, buyOpinions, sellOpinions, updatedOpinions };
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 멀티 슬롯 평가: 보유 중에도 다른 전략 조건 독립 체크
+// 주 전략(ENTRY_${stockName})과 별개로 SLOT_${stockName}_${strategy} 키로 관리
+// ──────────────────────────────────────────────────────────────────────────────
+function processMultiSlots(stockName, row, globalData, now, allProperties, kstDate, changes, props) {
+  const C           = Utils.COL_INDICES;
+  const S           = Utils.STRATEGY;
+  const displayName = Utils.getDisplayName(stockName, row);
+  const price       = Number(row[C.currentPrice]) || 0;
+  const fmtP        = Utils.fmtPrice(price, stockName);
+  if (!price) return;
+
+  // 주 전략 식별 (중복 방지)
+  const primaryEntry    = Utils.loadEntryInfoFrom(stockName, allProperties);
+  const primaryStrategy = primaryEntry.price > 0 ? primaryEntry.strategyType : null;
+
+  const STRATEGIES = ["A", "B", "C", "D", "E", "F"];
+
+  for (const strategy of STRATEGIES) {
+    // 주 전략과 동일한 그룹은 기존 로직에서 이미 처리 → 스킵
+    if (strategy === primaryStrategy) continue;
+
+    // 이메일에 표시할 전략 레이블 (보유 중 / 신규 구분)
+    const stratShortLabel = s =>
+      s === "A" ? "A그룹 [모멘텀 재가속]"
+    : s === "B" ? "B그룹 [공황 저점]"
+    : s === "C" ? "C그룹 [스퀴즈 거래량 돌파]"
+    : s === "D" ? "D그룹 [상승 흐름 강화]"
+    : s === "E" ? "E그룹 [스퀴즈 저점]"
+    :             "F그룹 [BB 극단 저점]";
+
+    const primaryFromLabel = primaryStrategy
+      ? `${stratShortLabel(primaryStrategy)} 보유중`
+      : "보유중";
+
+    const slot       = Utils.loadSlot(stockName, strategy, allProperties);
+    const isOccupied = slot !== null;
+
+    if (isOccupied) {
+      // ── 슬롯 청산 조건 체크 (활성 슬롯이면 주 전략 여부와 무관하게 항상 체크) ──
+      const exitResult = Utils.evaluateSlotExit(row, globalData, now, slot, strategy, allProperties);
+      if (!exitResult) continue;
+
+      const returnPct  = ((price - slot.price) / slot.price * 100).toFixed(2);
+      const entryNote  = `진입가 ${Utils.fmtPrice(slot.price, stockName)} · 수익률 ${Number(returnPct) >= 0 ? "+" : ""}${returnPct}%`;
+
+      changes.push({
+        stock: displayName, ticker: stockName,
+        from:  `${stratShortLabel(strategy)} 보유중`,
+        to:    "매도",
+        reason: exitResult.reason, price: fmtP, entryNote, stopLoss: ""
+      });
+
+      Utils.recordSlotSellSignal(stockName, strategy, kstDate, price);
+      Utils.clearSlot(stockName, strategy, props);
+      // 슬롯 재진입 쿨다운 기록
+      const dateStr = typeof kstDate === "string" ? kstDate : Utilities.formatDate(kstDate, "Asia/Seoul", "yyyy-MM-dd");
+      props.setProperty(`SLOT_SELL_${stockName}_${strategy}`, `${dateStr}|${price}`);
+      console.log(`[슬롯 매도] ${displayName} ${strategy}그룹: ${exitResult.reason}`);
+
+    } else {
+      // ── 슬롯 신규 진입 조건 체크 ─────────────────────────────────────────
+      // 주 전략 포지션이 없는 순수 관망 종목은 기존 handleOpinionChange 경로로 처리
+      // → 중복 신호 방지를 위해 primaryEntry가 있을 때만 병행 진입 허용
+      if (!primaryEntry || primaryEntry.price <= 0) continue;
+
+      const canEnter = Utils.evaluateSlotEntry(row, globalData, strategy, stockName);
+      if (!canEnter) continue;
+
+      // 매도 후 재진입 쿨다운은 슬롯에서도 적용 (슬롯별 SELL 기록 없으면 허용)
+      const slotSellKey = `SLOT_SELL_${stockName}_${strategy}`;
+      const slotSellVal = allProperties[slotSellKey];
+      if (slotSellVal) {
+        const sellTime     = Utils.parseDateKST(slotSellVal.split("|")[0]);
+        const sellPrice    = Number(slotSellVal.split("|")[1]) || 0;
+        const elapsedHours = sellTime ? (now - sellTime) / (1000 * 60 * 60) : S.SELL_HOLD_HOURS + 1;
+        const daysSinceSell = Utils.calcTradingDays(sellTime, now);
+        if (elapsedHours < S.SELL_HOLD_HOURS) { console.log(`[슬롯 진입 보류] ${displayName} ${strategy}그룹: 매도 후 ${elapsedHours.toFixed(1)}h 대기중`); continue; }
+        if (daysSinceSell <= S.REENTRY_DAYS && !(sellPrice > 0 && price <= sellPrice * (1 - S.REENTRY_DROP))) { console.log(`[슬롯 진입 보류] ${displayName} ${strategy}그룹: 재진입 필터`); continue; }
+      }
+
+      const dateStr   = typeof kstDate === "string" ? kstDate : Utilities.formatDate(kstDate, "Asia/Seoul", "yyyy-MM-dd");
+      const label     = strategyDisplayName(strategy);
+
+      // 병행 진입 메모 (최초 진입가 표시용)
+      const cyclePrice  = parseFloat(allProperties[`CYCLE_ENTRY_${stockName}`] || "0") || 0;
+      const entryNote   = cyclePrice > 0
+        ? `병행 진입 (${strategy}그룹) — 최초 사이클 진입가 ${Utils.fmtPrice(cyclePrice, stockName)}`
+        : `병행 진입 (${strategy}그룹)`;
+      const reason      = Utils.buildSlotBuyReason(strategy, row, globalData);
+
+      changes.push({
+        stock: displayName, ticker: stockName,
+        from:  primaryFromLabel,
+        to:    `${stratShortLabel(strategy)} 추가매수`,
+        reason, price: fmtP, entryNote, stopLoss: ""
+      });
+
+      Utils.saveSlot(stockName, strategy, price, dateStr, props);
+      Utils.recordBuySignal(stockName, dateStr, price, label);
+      console.log(`[슬롯 매수] ${displayName} ${strategy}그룹 병행 진입: ${reason}`);
+    }
+  }
+}
+
+function handleOpinionChange(stockName, fromOpinion, toOpinion, row, currentGlobalData, lastEvent, kstDate, lastReason, changes, updatedOpinions, now, evaluatedReason, evaluatedStrategyType, allProperties, props) {
+  const isCooldownMsg = r => typeof r === "string" && r.indexOf("매도 유지") !== -1 && (r.indexOf("48시간") !== -1 || r.indexOf("재진입 필터") !== -1 || r.indexOf("쿨다운") !== -1);
+  const isReentryMsg  = r => typeof r === "string" && r.indexOf("재진입 조건 충족") !== -1;
+
+  let reason;
+  if (toOpinion === "매도") {
+    const savedExitReason = allProperties[`EXIT_REASON_${stockName}`] || null;
+    reason = (savedExitReason)
+      ? savedExitReason
+      : (evaluatedReason && !isCooldownMsg(evaluatedReason) && !isReentryMsg(evaluatedReason))
+      ? evaluatedReason
+      : Utils.summarizeChangeReason(fromOpinion, toOpinion, currentGlobalData, lastEvent, row, now, lastReason, allProperties);
+  } else if (fromOpinion === "초기값" && toOpinion === "매수") {
+    reason = Utils.summarizeChangeReason("관망", "매수", currentGlobalData, lastEvent, row, now, lastReason, allProperties, evaluatedStrategyType);
+  } else {
+    reason = Utils.summarizeChangeReason(fromOpinion, toOpinion, currentGlobalData, lastEvent, row, now, lastReason, allProperties, toOpinion === "매수" ? evaluatedStrategyType : null);
+  }
+
+  const C           = Utils.COL_INDICES;
+  const price       = Number(row[C.currentPrice]) || 0;
+  const fmtP        = Utils.fmtPrice(price, stockName);
+  const displayName = Utils.getDisplayName(stockName, row);
+  let entryNote     = null;
+
+  if (toOpinion === "매수") {
+    props.deleteProperty(`UPPER_EXIT_ARM_${stockName}`);
+    const soldFlag    = allProperties[`SOLD_FLAG_${stockName}`];
+    const cycleEntry  = allProperties[`CYCLE_ENTRY_${stockName}`];
+    const isNewTrade  = (!allProperties[`ENTRY_${stockName}`] && !soldFlag) || !!soldFlag || fromOpinion === "초기값" || !cycleEntry;
+    if (isNewTrade) {
+      entryNote = "신규 진입";
+      props.deleteProperty(`SOLD_FLAG_${stockName}`);
+      props.setProperty(`REENTRY_COUNT_${stockName}`, "0");
+      props.setProperty(`CYCLE_ENTRY_${stockName}`, String(price));
+      console.log(`[진입 구분] ${displayName}: 신규 진입 (가격: ${fmtP})`);
+    } else {
+      const prevCount  = parseInt(allProperties[`REENTRY_COUNT_${stockName}`] || "0");
+      const newCount   = prevCount + 1;
+      const cyclePrice = parseFloat(allProperties[`CYCLE_ENTRY_${stockName}`] || "0") || 0;
+      props.setProperty(`REENTRY_COUNT_${stockName}`, String(newCount));
+      entryNote = cyclePrice > 0 ? `재진입 ${newCount}회차 — 최초 진입가 ${Utils.fmtPrice(cyclePrice, stockName)}` : `재진입 ${newCount}회차`;
+      console.log(`[진입 구분] ${displayName}: ${entryNote}`);
+    }
+  }
+
+  if (toOpinion === "매도") {
+    props.deleteProperty(`UPPER_EXIT_ARM_${stockName}`);
+    const saved = Utils.loadEntryInfoFrom(stockName, allProperties);
+    if (saved.price > 0) {
+      const entryDateStr = saved.date ? Utilities.formatDate(new Date(saved.date), "Asia/Seoul", "yyyy.MM.dd") : "-";
+      const returnPct    = ((price - saved.price) / saved.price * 100).toFixed(2);
+      entryNote = `진입가 ${Utils.fmtPrice(saved.price, stockName)} (${entryDateStr}) · 수익률 ${Number(returnPct) >= 0 ? "+" : ""}${returnPct}%`;
+    }
+    props.setProperty(`SOLD_FLAG_${stockName}`, "true");
+    console.log(`[SOLD_FLAG 세팅] ${displayName}`);
+  }
+
+  changes.push({ stock: displayName, ticker: stockName, from: fromOpinion, to: toOpinion, reason, price: fmtP, entryNote, stopLoss: "" });
+
+  if (toOpinion === "매수" && fromOpinion !== "매수") {
+    const existingEntry = Utils.loadEntryInfoFrom(stockName, allProperties);
+    // 관망 상태도 포지션 보유 중 → 다른 전략 신호 충돌 감지 대상에 포함
+    const hasConflictingPrimary = (fromOpinion === "매수" || fromOpinion === "관망")
+      && existingEntry.price > 0
+      && existingEntry.strategyType
+      && evaluatedStrategyType                                // 새 전략이 확정된 경우에만 충돌로 판단
+      && existingEntry.strategyType !== evaluatedStrategyType;
+
+    if (hasConflictingPrimary) {
+      console.log(`[멀티슬롯 위임] ${displayName}: 기존 ${existingEntry.strategyType}그룹 PRIMARY 보유 중 (${fromOpinion} 상태) → ${evaluatedStrategyType}그룹 신호는 processMultiSlots에 위임 (ENTRY_ 덮어쓰기 방지)`);
+    } else {
+      // 전략 타입 결정 우선순위: evaluatedStrategyType → ENTRY_ 키 → 시트 BC열
+      // "F" 기본값 제거: 타이밍 차이로 evaluatedStrategyType이 null이더라도 기존 보유 전략 사용
+      let resolvedBuyStrategy = evaluatedStrategyType;
+      if (!resolvedBuyStrategy && existingEntry.price > 0 && existingEntry.strategyType) {
+        resolvedBuyStrategy = existingEntry.strategyType;
+        console.log(`[전략 보완] ${displayName}: evaluatedStrategyType 미결정 → ENTRY_ 키 전략 "${resolvedBuyStrategy}" 사용`);
+      }
+      if (!resolvedBuyStrategy) {
+        const sheetStratStr = String(row[Utils.COL_INDICES.entryStrategy] || "").trim();
+        if (sheetStratStr) {
+          resolvedBuyStrategy = sheetStratStr.charAt(0).toUpperCase();
+          console.log(`[전략 보완] ${displayName}: ENTRY_ 키 없음 → 시트 BC열 전략 "${resolvedBuyStrategy}" 사용`);
+        }
+      }
+      if (!resolvedBuyStrategy) {
+        console.log(`[경고] ${displayName}: 매수 신호 기록 시 전략 타입 미결정 — 레이블 없이 기록`);
+      }
+      Utils.recordBuySignal(stockName, kstDate, price, resolvedBuyStrategy ? strategyDisplayName(resolvedBuyStrategy) : "");
+    }
+  }
+  if (toOpinion === "매도" && fromOpinion !== "매도") {
+    // 전략 코드 우선순위: evaluatedStrategyType → 시트 BC열(entryStrategy) → ENTRY_ 키
+    let finalStrategyType = evaluatedStrategyType;
+    if (!finalStrategyType) {
+      const sheetStratStr = String(row[Utils.COL_INDICES.entryStrategy] || "").trim();
+      if (sheetStratStr) finalStrategyType = sheetStratStr.charAt(0).toUpperCase();
+    }
+    if (!finalStrategyType) {
+      const saved = Utils.loadEntryInfoFrom(stockName, allProperties);
+      if (saved.price > 0 && saved.strategyType) finalStrategyType = saved.strategyType;
+    }
+    const sellLabel = finalStrategyType ? strategyDisplayName(finalStrategyType) : null;
+    Utils.recordSellSignal(stockName, kstDate, price, sellLabel);
+  }
+
+  updatedOpinions[stockName] = { opinion: toOpinion, reason: Utils.summarizeChangeReason(toOpinion, toOpinion, currentGlobalData, lastEvent, row, now, reason, allProperties) };
+}
+
+const Utils = {
+
+  _tradingLogSheetCache: null,
+  _tradingLogSheetCacheId: null,
+  _nextTradingLogRowCache: null,
+
+  COL_INDICES: {
+    stockName:    0,
+    stockLabel:   1,
+    currentPrice: 44,
+    opinion:      3,
+    rsi:          4,
+    cci:          8,
+    macdHist:     15,
+    macdHistD1:   16,
+    macdHistD2:   17,
+    pctB:         37,
+    pctBLow:      38,
+    candleLow:    27,
+    bbWidth:      41,
+    bbWidthD1:    42,  // BB폭 D-1 (AQ열 추정 — 확인 필요)
+    bbWidthAvg60: 43,
+    ma200:        49,
+    lrTrendline:  50,
+    entryPrice:   52,
+    entryDate:    53,
+    entryStrategy: 54,
+    // ── C/D그룹 신규 컬럼 — 시트에서 인덱스 확인 후 수정 ──────────────────
+    volRatio:  35,  // 20일 평균 대비 거래량 (AJ열) — C그룹 ④
+    plusDI:    19,  // +DI (DMI, T열) — D그룹 ③
+    minusDI:   20,  // -DI (DMI, U열) — D그룹 ③
+    adx:       21,  // ADX D (V열) — D그룹 ④⑤
+    adxD1:     22,  // ADX D-1 (W열) — D그룹 ⑤ 기울기
+  },
+
+  STRATEGY: {
+    VIX_MIN:         25,
+    VIX_RELEASE:     23,
+    RSI_MAX:         40,
+    CCI_MIN:        -100,
+    // A그룹 (구 C | 200일선 상방 & 모멘텀 재가속): +20% 즉시
+    TARGET_PCT_A:           0.20,
+    CIRCUIT_PCT_A:          0.30,
+    GOLDEN_CROSS_PCTB_MIN:  80,
+    GOLDEN_CROSS_RSI_MIN:   70,
+    // B그룹 (구 D | 200일선 하방 & 공황 저점): +20% 즉시
+    TARGET_PCT_B:    0.20,
+    CIRCUIT_PCT_B:   0.30,
+    // C그룹 (NEW | 200일선 상방 & 스퀴즈 거래량 돌파): +18% 즉시
+    TARGET_PCT_C:              0.18,
+    CIRCUIT_PCT_C:             0.30,
+    BB_EXPAND_RATIO:           1.05,
+    SQUEEZE_BREAKOUT_VOL_RATIO: 1.5,
+    SQUEEZE_BREAKOUT_PCTB_MIN:  55,
+    // D그룹 (NEW | 200일선 상방 & 상승 흐름 강화): +18% 즉시
+    TARGET_PCT_D:    0.18,
+    CIRCUIT_PCT_D:   0.30,
+    ADX_MIN:         20,
+    ADX_PCTB_MIN:    30,
+    ADX_PCTB_MAX:    75,
+    // E그룹 (구 A | 200일선 상방 & 스퀴즈 저점): +8% MACD 게이트
+    TARGET_PCT_E:    0.08,
+    CIRCUIT_PCT_E:   0.30,
+    SQUEEZE_RATIO:   0.5,
+    SQUEEZE_PCT_B_MAX: 50,
+    // F그룹 (구 B | 200일선 상방 & BB 극단 저점): +8% MACD 게이트
+    TARGET_PCT_F:    0.08,
+    CIRCUIT_PCT_F:   0.30,
+    BB_PCT_B_LOW_MAX: 5,
+    // 공통
+    HALF_EXIT_DAYS:    60,
+    MAX_HOLD_DAYS:     120,
+    SELL_HOLD_HOURS:   48,
+    REENTRY_DAYS:      10,
+    REENTRY_DROP:      0.03,
+    NASDAQ_DIST_UPPER:   -3,
+    NASDAQ_DIST_LOWER:   -12,
+    NASDAQ_DIST_RELEASE: -2.5,
+    UPPER_EXIT_MAX_WAIT_DAYS:       5,
+    HOLD_RESTORE_DROP:              0.03,
+    HOLD_RESTORE_MIN_TRADING_DAYS:  3
+  },
+
+  /** 시장트렌드 순위 키워드 ↔ 가치분석 산업 토큰 연결 (완전일치 외 보강용) */
+  TREND_SYNONYM_GROUPS: [
+    ["2차전지", "이차전지", "2차 전지", "이차 전지", "리튬이온", "리튬배터리", "전기차", "모빌리티"],
+    ["배터리", "배터리소재", "전고체", "ESS"],
+    ["양극재", "NCM", "NCA", "LFP", "전고체"],
+    ["데이터센터", "데이터 센터", "IDC", "콜로케이션"],
+    ["AI인프라", "AI 인프라", "인공지능인프라", "고속인터커넥트", "인터커넥트"],
+    ["반도체", "시스템반도체", "비메모리", "메모리반도체", "메모리", "파운드리", "팹리스", "반도체산업"],
+    ["후공정", "패키징", "테스트", "EMS", "어드밴스드패키징", "Advanced Packaging", "CoWoS", "패키지"],
+    ["바이오", "제약", "바이오테크"],
+    ["원전", "원자력", "SMR"],
+    ["방산", "국방", "항공우주"],
+    ["금융", "은행", "증권", "보험", "캐피탈"],
+    ["엔터테인먼트", "미디어", "게임"]
+  ],
+
+  /** 산업/트렌드 매칭에서 단독으로 쓰면 오탐이 잦은 일반 토큰 */
+  TREND_GENERIC_TOKENS: ["인프라", "플랫폼", "서비스", "시스템", "솔루션", "네트워크"],
+
+  _normTrendToken(s) {
+    const t = String(s || "").trim().replace(/^[(\[\s]+|[)\]\s]+$/g, "");
+    if (/^[A-Za-z0-9.\-\s]+$/.test(t)) return t.replace(/\s+/g, "").toLowerCase();
+    return t.replace(/\s+/g, "");
+  },
+
+  _isGenericTrendToken(token) {
+    const base = Utils._normTrendToken(token);
+    return Utils.TREND_GENERIC_TOKENS.some(t => Utils._normTrendToken(t) === base);
+  },
+
+  _expandSynonymTokens(token) {
+    const raw = String(token || "").trim();
+    if (!raw) return [];
+    const base = Utils._normTrendToken(raw);
+    const out  = new Set([raw, base]);
+    for (const g of Utils.TREND_SYNONYM_GROUPS) {
+      const hit = g.some(m => Utils._normTrendToken(m) === base || m === raw);
+      if (!hit) continue;
+      g.forEach(m => {
+        out.add(m);
+        out.add(Utils._normTrendToken(m));
+      });
+    }
+    return [...out];
+  },
+
+  /** 동의어 확장 후 완전 일치만 허용 (일반 토큰/부분문자열 오탐 방지) */
+  _trendTokensMatch(ik, tk) {
+    const iList = Utils._expandSynonymTokens(ik);
+    const tList = Utils._expandSynonymTokens(tk);
+    for (const a of iList) {
+      for (const b of tList) {
+        const na = Utils._normTrendToken(a);
+        const nb = Utils._normTrendToken(b);
+        if (na.length < 2 || nb.length < 2) continue;
+        if (Utils._isGenericTrendToken(na) || Utils._isGenericTrendToken(nb)) continue;
+        if (na === nb) return true;
+      }
+    }
+    return false;
+  },
+
+  parseDateKST(str) {
+    if (!str) return null;
+    if (/[+-]\d{2}:\d{2}$/.test(str) || str.endsWith("Z")) return new Date(str);
+    if (/^\d{4}-\d{2}-\d{2}$/.test(str)) return new Date(str + "T00:00:00+09:00");
+    if (/^\d{4}\.\s*\d{2}\.\s*\d{2}$/.test(str)) {
+      const normalized = str.replace(/\s/g, "").replace(/\./g, "-");
+      return new Date(normalized + "T00:00:00+09:00");
+    }
+    if (/^\d{4}\.\s*\d{2}\.\s*\d{2},\s*\d{2}:\d{2}:\d{2}$/.test(str)) {
+      const m = str.match(/^(\d{4})\.\s*(\d{2})\.\s*(\d{2}),\s*(\d{2}):(\d{2}):(\d{2})$/);
+      if (m) return new Date(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}+09:00`);
+    }
+    return new Date(str + "+09:00");
+  },
+
+  saveUpperExitArm(stockName, date) {
+    const value = Utilities.formatDate(date, "Asia/Seoul", "yyyy-MM-dd'T'HH:mm:ss") + "+09:00";
+    PropertiesService.getScriptProperties().setProperty(`UPPER_EXIT_ARM_${stockName}`, value);
+  },
+
+  loadUpperExitArmFrom(stockName, allProperties) {
+    const value = allProperties && allProperties[`UPPER_EXIT_ARM_${stockName}`];
+    return value ? Utils.parseDateKST(value) : null;
+  },
+
+  clearUpperExitArm(stockName) {
+    PropertiesService.getScriptProperties().deleteProperty(`UPPER_EXIT_ARM_${stockName}`);
+  },
+
+  getDisplayName(stockName, row) {
+    if (!Utils.isKoreanStock(stockName)) return stockName;
+    const krName = String(row[Utils.COL_INDICES.stockLabel] || "").trim();
+    return krName ? `${krName}(${stockName})` : stockName;
+  },
+
+  fmtPrice(v, stockName) {
+    const isKR = /[ㄱ-ㅎ가-힣]/.test(stockName || "") || /^\d{6}$/.test(String(stockName || "").trim());
+    return isKR ? "₩" + Math.round(Number(v)).toLocaleString("ko-KR") : "$" + Number(v).toFixed(2);
+  },
+
+  getTradingLogPriceValue(v, stockName) {
+    const num = Number(v) || 0;
+    return Utils.isKoreanStock(stockName) ? Math.round(num) : Number(num.toFixed(2));
+  },
+
+  parseTradingLogPriceInput(v) {
+    if (v === null || v === undefined || v === "") return null;
+    if (typeof v === "number") return isNaN(v) ? null : v;
+
+    const normalized = String(v).trim().replace(/[₩$,]/g, "").replace(/,/g, "");
+    if (!normalized) return null;
+
+    const num = Number(normalized);
+    return isNaN(num) ? null : num;
+  },
+
+  getTradingLogPriceFormat(stockName) {
+    return Utils.isKoreanStock(stockName) ? '"₩"#,##0' : '"$"#,##0.00';
+  },
+
+  setTradingLogPriceCell(cell, stockName, price) {
+    const logPrice = Utils.getTradingLogPriceValue(price, stockName);
+    cell.setValue(logPrice);
+    cell.setNumberFormat(Utils.getTradingLogPriceFormat(stockName));
+    return logPrice;
+  },
+
+  normalizeTradingLogPriceCell(cell, stockName, rawValue) {
+    const parsed = Utils.parseTradingLogPriceInput(rawValue);
+    if (parsed === null) return false;
+    Utils.setTradingLogPriceCell(cell, stockName, parsed);
+    return true;
+  },
+
+  fmtNumOrDash(v, decimals) {
+    if (v === null || v === undefined || isNaN(v)) return "-";
+    return Number(v).toFixed(decimals !== undefined ? decimals : 2);
+  },
+
+  isKoreanStock(stockName) {
+    return /^\d{6}$/.test(String(stockName || "").trim());
+  },
+
+  getTimeDetails(now) {
+    return {
+      kstDate:     Utilities.formatDate(now, "Asia/Seoul", "yyyy. MM. dd, HH:mm:ss"),
+      kstDateOnly: Utilities.formatDate(now, "Asia/Seoul", "yyyy-MM-dd"),
+      kstHour:     Number(Utilities.formatDate(now, "Asia/Seoul", "HH")),
+      kstMinute:   Number(Utilities.formatDate(now, "Asia/Seoul", "mm")),
+      estString:   Utilities.formatDate(now, "America/New_York", "M/d/yyyy, h:mm:ss a")
+    };
+  },
+
+  isDST(date = new Date()) {
+    const year                = date.getFullYear();
+    const marchSecondSunday   = new Date(year, 2, 14 - new Date(year, 2, 1).getDay());
+    const novemberFirstSunday = new Date(year, 10, 7 - new Date(year, 10, 1).getDay());
+    return date.getTime() >= marchSecondSunday.getTime() && date.getTime() < novemberFirstSunday.getTime();
+  },
+
+  checkMarketOpen(now, isKR = false) {
+    const kstHour      = Number(Utilities.formatDate(now, "Asia/Seoul", "HH"));
+    const kstMinute    = Number(Utilities.formatDate(now, "Asia/Seoul", "mm"));
+    const kstDayOfWeek = Number(Utilities.formatDate(now, "Asia/Seoul", "u")) % 7;
+    if (kstDayOfWeek === 0 || kstDayOfWeek === 6) return false;
+    if (isKR) {
+      return (kstHour > 9 || (kstHour === 9 && kstMinute >= 0)) && (kstHour < 15 || (kstHour === 15 && kstMinute <= 30));
+    } else {
+      const [openHour, closeHour] = Utils.isDST(now) ? [22, 5] : [23, 6];
+      return (kstHour === openHour && kstMinute >= 30) || (kstHour > openHour && kstHour < 24) || (kstHour >= 0 && kstHour < closeHour);
+    }
+  },
+
+  getSheets(sheetName) {
+    const spreadsheet   = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet         = spreadsheet.getSheetByName(sheetName);
+    const spreadsheetId = sheet.getRange("I1").getValue();
+    try {
+      const targetSpreadsheet = SpreadsheetApp.openById(spreadsheetId);
+      return { sheet, targetSheet: targetSpreadsheet.getSheetByName(sheetName) };
+    } catch (e) {
+      console.log(`FATAL: 스프레드시트 접근 실패 (${spreadsheetId}). 오류: ${e}`);
+      return { sheet, targetSheet: null };
+    }
+  },
+
+  getGlobalData(targetSheet, allProperties) {
+    const event     = String(targetSheet.getRange("M1").getValue()).trim() || "당분간 없음";
+    const vixToday  = Number(targetSheet.getRange("O1").getValue()) || 0;
+    const ixicPrice = Number(targetSheet.getRange("W1").getValue()) || 0;
+    const ixicMa200 = Number(targetSheet.getRange("AE1").getValue()) || 0;
+    const ixicDist  = (ixicPrice > 0 && ixicMa200 > 0) ? (ixicPrice / ixicMa200 - 1) * 100 : 100;
+    const ixicFilterActive = typeof computeNasdaqABFilterActive === "function"
+      ? computeNasdaqABFilterActive(ixicDist)
+      : ixicDist < Utils.STRATEGY.NASDAQ_DIST_UPPER && ixicDist > Utils.STRATEGY.NASDAQ_DIST_LOWER;
+    const nasdaqPeakAlert = allProperties
+      ? allProperties["NasdaqPeakSellState"] === "TRUE"
+      : PropertiesService.getScriptProperties().getProperty("NasdaqPeakSellState") === "TRUE";
+    return { vixToday, event, ixicDist, ixicFilterActive, nasdaqPeakAlert };
+  },
+
+  getLastValues() {
+    const saved  = PropertiesService.getScriptProperties().getProperty("lastValues");
+    // data 필드는 더 이상 저장하지 않음 (JSON 크기 절감)
+    let result   = saved ? JSON.parse(saved) : { initialized: false, vixToday: 0, event: "당분간 없음", lastValidOpinions: {} };
+    // 레거시 마이그레이션: data 필드가 있던 구 버전은 initialized: true 로 취급
+    if (!Object.prototype.hasOwnProperty.call(result, "initialized")) {
+      result.initialized = Array.isArray(result.data) && result.data.length > 0;
+    }
+    delete result.data; // 혹여 남아있는 구 data 필드 제거 (메모리 절감)
+    if (result.lastValidOpinions && Object.keys(result.lastValidOpinions).length > 0) {
+      const firstVal = result.lastValidOpinions[Object.keys(result.lastValidOpinions)[0]];
+      if (typeof firstVal === "string") {
+        const migrated = {};
+        for (const stock in result.lastValidOpinions) migrated[stock] = { opinion: result.lastValidOpinions[stock], reason: `${result.lastValidOpinions[stock]} 조건 충족` };
+        result.lastValidOpinions = migrated;
+      }
+    }
+    if (!result.vixToday) result.vixToday = 0;
+    if (!result.event)    result.event    = "당분간 없음";
+    return result;
+  },
+
+  // currentData 파라미터는 하위 호환성을 위해 유지하지만 저장하지 않음
+  // getLastValues()를 재호출하지 않도록 직접 구성 (Props 읽기 1회 절감)
+  saveLastValues(_currentData, updatedValidOpinions = null, currentGlobalData = {}) {
+    const toSave = {
+      initialized:       true,
+      vixToday:          currentGlobalData.vixToday  ?? 0,
+      event:             currentGlobalData.event      ?? "당분간 없음",
+      lastValidOpinions: updatedValidOpinions         ?? {},
+    };
+    PropertiesService.getScriptProperties().setProperty("lastValues", JSON.stringify(toSave));
+  },
+
+  snapshotOpinionsForTracking() {
+    const { targetSheet } = Utils.getSheets("기술분석");
+    if (!targetSheet) { console.log("[스냅샷] 시트 접근 실패"); return; }
+    const allProperties     = PropertiesService.getScriptProperties().getProperties();
+    const currentGlobalData = Utils.getGlobalData(targetSheet, allProperties);
+    const currentData       = targetSheet.getRange(3, 1, targetSheet.getLastRow() - 2, targetSheet.getLastColumn()).getValues();
+    const C                 = Utils.COL_INDICES;
+    const currentOpinions   = {};
+    currentData.forEach(row => {
+      const name    = String(row[C.stockName]).trim();
+      const opinion = String(row[C.opinion]).trim();
+      if (name && Utils.isValidOpinion(opinion)) currentOpinions[name] = { opinion, reason: "스냅샷" };
+    });
+    Utils.saveLastValues(null, currentOpinions, currentGlobalData);
+    console.log(`[스냅샷] 업데이트 전 투자의견 저장 완료 (${Object.keys(currentOpinions).length}종목)`);
+  },
+
+  isInitialRun(lastValues, targetSheet, currentGlobalData) {
+    if (!lastValues.initialized) {
+      const currentData     = targetSheet.getRange(3, 1, targetSheet.getLastRow() - 2, targetSheet.getLastColumn()).getValues();
+      const initialOpinions = {};
+      const C               = Utils.COL_INDICES;
+      currentData.forEach(row => {
+        const name    = String(row[C.stockName]).trim();
+        const opinion = String(row[C.opinion]).trim();
+        if (name && Utils.isValidOpinion(opinion)) initialOpinions[name] = { opinion, reason: "초기값 설정" };
+      });
+      Utils.saveLastValues(null, initialOpinions, currentGlobalData);
+      console.log("초기 실행: 현재 의견 저장 후 종료");
+      return true;
+    }
+    return false;
+  },
+
+  isValidOpinion(value) {
+    return typeof value === "string" && ["매수", "관망", "매도"].includes(value);
+  },
+
+  toNum(val) {
+    if (val === null || val === undefined || val === "" || val instanceof Date || typeof val === "object") return null;
+    const s = String(val).trim();
+    if (s.indexOf("#") === 0 || s.toLowerCase() === "loading..." || s === "데이터 부족") return null;
+    const n = Number(val);
+    return isNaN(n) ? null : n;
+  },
+
+  calcTradingDays(fromDate, toDate) {
+    if (!fromDate || !toDate) return 0;
+    let count = 0;
+    const cursor = new Date(fromDate);
+    cursor.setHours(0, 0, 0, 0);
+    const end = new Date(toDate);
+    end.setHours(0, 0, 0, 0);
+    while (cursor < end) {
+      cursor.setDate(cursor.getDate() + 1);
+      const dow = cursor.getDay();
+      if (dow !== 0 && dow !== 6) count++;
+    }
+    return count;
+  },
+
+  loadEntryInfoFrom(stockName, allProperties) {
+    const val = allProperties[`ENTRY_${stockName}`];
+    if (!val) return { price: 0, date: null, strategyType: "A" };
+    const parts = val.split("|");
+    const rawType = parts[2] || "A";
+    // 레거시 문자열 키만 재매핑, A-F letter는 현재 체계를 그대로 사용
+    const legacyMap = {
+      "squeeze": "E", "ma200u": "F", "ma200d": "B"
+    };
+    const strategyType = /^[A-F]$/.test(rawType)
+      ? rawType
+      : (legacyMap[rawType] !== undefined ? legacyMap[rawType] : rawType);
+    return { price: Number(parts[0]) || 0, date: parts[1] ? Utils.parseDateKST(parts[1]) : null, strategyType };
+  },
+
+  loadSellTimeFrom(stockName, allProperties) {
+    const val = allProperties[`SELL_${stockName}`];
+    return val ? Utils.parseDateKST(val.split("|")[0]) : null;
+  },
+
+  loadSellPriceFrom(stockName, allProperties) {
+    const val = allProperties[`SELL_${stockName}`];
+    if (!val) return 0;
+    const parts = val.split("|");
+    return parts[1] ? Number(parts[1]) : 0;
+  },
+
+  calcSqueeze(row) {
+    const C            = Utils.COL_INDICES;
+    const bbWidth      = Utils.toNum(row[C.bbWidth]);
+    const bbWidthAvg60 = Utils.toNum(row[C.bbWidthAvg60]);
+    if (bbWidth === null || bbWidthAvg60 === null || bbWidthAvg60 <= 0) return false;
+    return (bbWidth / bbWidthAvg60) < Utils.STRATEGY.SQUEEZE_RATIO;
+  },
+
+  evaluateOpinion(row, globalData, now, allProperties = {}) {
+    const C            = Utils.COL_INDICES;
+    const S            = Utils.STRATEGY;
+    const stockName    = String(row[C.stockName]).trim();
+    const currentPrice = Utils.toNum(row[C.currentPrice]);
+    const ma200        = Utils.toNum(row[C.ma200]);
+    const rsi          = Utils.toNum(row[C.rsi]);
+    const cci          = Utils.toNum(row[C.cci]);
+    const macdHist     = Utils.toNum(row[C.macdHist]);
+    const macdHistD1   = Utils.toNum(row[C.macdHistD1]);
+    const macdHistD2   = Utils.toNum(row[C.macdHistD2]);
+    const pctB         = Utils.toNum(row[C.pctB]);
+    const pctBLow      = Utils.toNum(row[C.pctBLow]);
+    const bbWidth      = Utils.toNum(row[C.bbWidth]);
+    const bbWidthD1    = Utils.toNum(row[C.bbWidthD1]);
+    const bbWidthAvg60 = Utils.toNum(row[C.bbWidthAvg60]);
+    const candleLow    = Utils.toNum(row[C.candleLow]);
+    const lrTrendline  = Utils.toNum(row[C.lrTrendline]);
+    const volRatio     = C.volRatio  >= 0 ? Utils.toNum(row[C.volRatio])  : null;
+    const plusDI       = C.plusDI    >= 0 ? Utils.toNum(row[C.plusDI])    : null;
+    const minusDI      = C.minusDI   >= 0 ? Utils.toNum(row[C.minusDI])   : null;
+    const adx          = C.adx       >= 0 ? Utils.toNum(row[C.adx])       : null;
+    const adxD1        = C.adxD1     >= 0 ? Utils.toNum(row[C.adxD1])     : null;
+    const vixToday     = globalData.vixToday;
+    const ixicDist     = globalData.ixicDist !== undefined ? globalData.ixicDist : 100;
+    const ixicFilterActive = globalData.ixicFilterActive !== undefined
+      ? globalData.ixicFilterActive
+      : (typeof computeNasdaqABFilterActive === "function" ? computeNasdaqABFilterActive(ixicDist) : ixicDist < S.NASDAQ_DIST_UPPER && ixicDist > S.NASDAQ_DIST_LOWER);
+    const currentOpinion  = String(row[C.opinion]).trim();
+    const isEventWatch    = globalData.event !== "당분간 없음";
+    const nasdaqPeakAlert = globalData.nasdaqPeakAlert;
+
+    const saved         = Utils.loadEntryInfoFrom(stockName, allProperties);
+    const entryPrice    = saved.price > 0 ? saved.price : (Utils.toNum(row[C.entryPrice]) || 0);
+    const entryDate     = saved.date || (row[C.entryDate] instanceof Date ? row[C.entryDate] : null);
+    const isHolding     = entryPrice > 0;
+    const savedStrategy = isHolding ? (saved.strategyType || "A") : null;
+    const vixThreshold  = isHolding ? S.VIX_RELEASE : S.VIX_MIN;
+
+    // 나스닥 필터
+    // strictMomentum (A/C/D): 강세장 전용 — 이격도 ≥ -3%, 찐바닥 예외 없음
+    const nasdaqAllowsStrictMomentum = !ixicFilterActive && ixicDist >= S.NASDAQ_DIST_UPPER;
+    // bottomBuy (E/F): 히스테리시스 + 찐바닥(≤ -12%) 허용
+    const nasdaqAllowsBottomBuy = !ixicFilterActive;
+
+    const hasRsi = rsi !== null;
+    const hasCci = cci !== null;
+    const rsiOk  = hasRsi && rsi < S.RSI_MAX;
+    const cciOk  = hasCci && cci < S.CCI_MIN;
+    const bCond3     = rsiOk || cciOk;
+    const bCond3Hold = (hasRsi || hasCci) && bCond3;
+    const bbPairOk   = bbWidth !== null && bbWidthAvg60 !== null && bbWidthAvg60 > 0;
+
+    // ── A그룹: MA200 위 + MACD 골든크로스 + %B>80 + RSI>70 ──────────────────
+    const aCond1 = currentPrice !== null && ma200 !== null && currentPrice > ma200;
+    const aCond2 = macdHistD1 !== null && macdHist !== null && macdHistD1 <= 0 && macdHist > 0;
+    const aCond3 = pctB !== null && pctB > S.GOLDEN_CROSS_PCTB_MIN;
+    const aCond4 = rsi !== null && rsi > S.GOLDEN_CROSS_RSI_MIN;
+    const entryGroupA = aCond1 && aCond2 && aCond3 && aCond4 && nasdaqAllowsStrictMomentum;
+
+    // ── B그룹: MA200 아래 + VIX + 과매도 + 추세선 ───────────────────────────
+    const bCond1 = currentPrice !== null && ma200 !== null && currentPrice < ma200;
+    const bCond2 = vixToday >= vixThreshold;
+    const lrSlope = (typeof getLRSlope === "function") ? getLRSlope(stockName) : 0;
+    const bCond4 = lrSlope > 0;
+    const bCond5 = lrTrendline !== null && lrTrendline > 0 && candleLow !== null && candleLow <= lrTrendline * 1.03;
+    const entryGroupB = bCond1 && bCond2 && bCond3 && bCond4 && bCond5;
+
+    // ── C그룹: MA200 위 + 전일 스퀴즈 + 당일 BB확장 + 거래량 폭발 ────────────
+    const cCond1 = currentPrice !== null && ma200 !== null && currentPrice > ma200;
+    const cCond2 = bbPairOk && bbWidthD1 !== null && (bbWidthD1 / bbWidthAvg60) < S.SQUEEZE_RATIO;
+    const cCond3 = bbPairOk && bbWidthD1 !== null && bbWidth > bbWidthD1 * S.BB_EXPAND_RATIO;
+    const cCond4 = volRatio !== null && volRatio >= S.SQUEEZE_BREAKOUT_VOL_RATIO;
+    const cCond5 = pctB !== null && pctB > S.SQUEEZE_BREAKOUT_PCTB_MIN;
+    const cCond6 = macdHist !== null && macdHist > 0;
+    const entryGroupC = !entryGroupA && !entryGroupB
+                     && cCond1 && cCond2 && cCond3 && cCond4 && cCond5 && cCond6
+                     && nasdaqAllowsStrictMomentum;
+
+    // ── D그룹: MA200 위 + +DI>-DI + ADX>20 + ADX상승 + MACD>0 + %B 30-75 ──
+    const dCond1 = currentPrice !== null && ma200 !== null && currentPrice > ma200;
+    const dCond2 = plusDI !== null && minusDI !== null && plusDI > minusDI;
+    const dCond3 = adx !== null && adx > S.ADX_MIN;
+    const dCond4 = adx !== null && adxD1 !== null && adx > adxD1;
+    const dCond5 = macdHist !== null && macdHist > 0;
+    const dCond6 = pctB !== null && pctB >= S.ADX_PCTB_MIN && pctB <= S.ADX_PCTB_MAX;
+    const entryGroupD = !entryGroupA && !entryGroupB && !entryGroupC
+                     && dCond1 && dCond2 && dCond3 && dCond4 && dCond5 && dCond6
+                     && nasdaqAllowsStrictMomentum;
+
+    // ── E그룹: MA200 위 + BB스퀴즈 + 저가%B≤50 ─────────────────────────────
+    const eCond1 = currentPrice !== null && ma200 !== null && currentPrice > ma200;
+    const eCond2 = bbPairOk && (bbWidth / bbWidthAvg60) < S.SQUEEZE_RATIO;
+    const eCond3 = pctBLow !== null && pctBLow <= S.SQUEEZE_PCT_B_MAX;
+    const entryGroupE = !entryGroupA && !entryGroupB && !entryGroupC && !entryGroupD
+                     && eCond1 && eCond2 && eCond3 && nasdaqAllowsBottomBuy;
+
+    // ── F그룹: MA200 위 + 저가%B≤5 ──────────────────────────────────────────
+    const fCond1 = currentPrice !== null && ma200 !== null && currentPrice > ma200;
+    const fCond2 = pctBLow !== null && pctBLow <= S.BB_PCT_B_LOW_MAX;
+    const entryGroupF = !entryGroupA && !entryGroupB && !entryGroupC && !entryGroupD && !entryGroupE
+                     && fCond1 && fCond2 && nasdaqAllowsBottomBuy;
+
+    let buyTriggered = entryGroupA || entryGroupB || entryGroupC || entryGroupD || entryGroupE || entryGroupF;
+    const newStrategy = entryGroupA ? "A" : entryGroupB ? "B" : entryGroupC ? "C"
+                      : entryGroupD ? "D" : entryGroupE ? "E" : entryGroupF ? "F" : null;
+
+    if (isHolding && entryPrice > 0 && entryDate) {
+      if (savedStrategy === "A") {
+        const macdOk = macdHist !== null && macdHist > 0;
+        buyTriggered = aCond1 && nasdaqAllowsStrictMomentum && macdOk;
+      } else if (savedStrategy === "B") {
+        buyTriggered = bCond1 && bCond2 && bCond3Hold && bCond4;
+      } else if (savedStrategy === "C") {
+        const macdOkC = macdHist !== null && macdHist > 0;
+        buyTriggered = cCond1 && nasdaqAllowsStrictMomentum && macdOkC;
+      } else if (savedStrategy === "D") {
+        const diOk    = plusDI !== null && minusDI !== null && plusDI > minusDI;
+        const macdOkD = macdHist !== null && macdHist > 0;
+        buyTriggered = dCond1 && nasdaqAllowsStrictMomentum && diOk && macdOkD;
+      } else if (savedStrategy === "E") {
+        buyTriggered = eCond1 && nasdaqAllowsBottomBuy && bbPairOk && pctBLow !== null && eCond2 && eCond3;
+      } else if (savedStrategy === "F") {
+        buyTriggered = fCond1 && nasdaqAllowsBottomBuy && pctBLow !== null && fCond2;
+      }
+
+      if (nasdaqPeakAlert) return { opinion: "매도", reason: "나스닥 고점 경고 — 강제 매도", strategyType: savedStrategy };
+
+      const cp          = currentPrice !== null ? currentPrice : 0;
+      const returnPct   = (cp - entryPrice) / entryPrice;
+      const tradingDays = Utils.calcTradingDays(entryDate, now);
+
+      const targetPct = savedStrategy === "A" ? S.TARGET_PCT_A
+                      : savedStrategy === "B" ? S.TARGET_PCT_B
+                      : savedStrategy === "C" ? S.TARGET_PCT_C
+                      : savedStrategy === "D" ? S.TARGET_PCT_D
+                      : savedStrategy === "E" ? S.TARGET_PCT_E
+                      : S.TARGET_PCT_F;
+      const circuitPct = savedStrategy === "A" ? S.CIRCUIT_PCT_A
+                       : savedStrategy === "B" ? S.CIRCUIT_PCT_B
+                       : savedStrategy === "C" ? S.CIRCUIT_PCT_C
+                       : savedStrategy === "D" ? S.CIRCUIT_PCT_D
+                       : savedStrategy === "E" ? S.CIRCUIT_PCT_E
+                       : S.CIRCUIT_PCT_F;
+      const label = savedStrategy === "A" ? "200일선 상방 & 모멘텀 재가속"
+                  : savedStrategy === "B" ? "200일선 하방 & 공황 저점"
+                  : savedStrategy === "C" ? "200일선 상방 & 스퀴즈 거래량 돌파"
+                  : savedStrategy === "D" ? "200일선 상방 & 상승 흐름 강화"
+                  : savedStrategy === "E" ? "200일선 상방 & 스퀴즈 저점"
+                  : "200일선 상방 & BB 극단 저점";
+
+      // E/F그룹만 MACD 게이트 (목표 도달 후 둔화전환 대기)
+      const isEfStrategy = savedStrategy === "E" || savedStrategy === "F";
+      let upperExitArmDate = isEfStrategy ? Utils.loadUpperExitArmFrom(stockName, allProperties) : null;
+
+      if (isEfStrategy && returnPct >= targetPct && !upperExitArmDate) {
+        Utils.saveUpperExitArm(stockName, now);
+        upperExitArmDate = now;
+      }
+
+      if (isEfStrategy && upperExitArmDate) {
+        const histTurnSignal =
+          macdHist !== null && macdHistD1 !== null && macdHistD2 !== null &&
+          (macdHist - macdHistD1) < (macdHistD1 - macdHistD2);
+        const waitDays = Utils.calcTradingDays(upperExitArmDate, now);
+        if (returnPct >= targetPct && histTurnSignal) {
+          return { opinion: "매도", reason: `목표 수익 구간 + MACD 히스토그램 둔화전환 매도 +${(returnPct * 100).toFixed(2)}% [${label}]`, strategyType: savedStrategy };
+        }
+        if (waitDays >= S.UPPER_EXIT_MAX_WAIT_DAYS) {
+          return { opinion: "매도", reason: `목표 수익 도달 후 ${S.UPPER_EXIT_MAX_WAIT_DAYS}거래일 대기 만료 매도 ${(returnPct * 100).toFixed(2)}% [${label}]`, strategyType: savedStrategy };
+        }
+      }
+
+      // A/B/C/D: 단순 목표수익 즉시 매도
+      if (!isEfStrategy && returnPct >= targetPct) {
+        return { opinion: "매도", reason: `목표 수익 달성 즉시 매도 +${(returnPct * 100).toFixed(2)}% [${label}]`, strategyType: savedStrategy };
+      }
+
+      if (returnPct <= -circuitPct)                           return { opinion: "매도", reason: `손절 기준 도달 -${Math.abs(returnPct * 100).toFixed(2)}% [${label}]`, strategyType: savedStrategy };
+      if (tradingDays >= S.HALF_EXIT_DAYS && returnPct > 0)  return { opinion: "매도", reason: "60거래일 경과 + 수익 중", strategyType: savedStrategy };
+      if (tradingDays >= S.MAX_HOLD_DAYS)                    return { opinion: "매도", reason: "최대 보유 기간 초과", strategyType: savedStrategy };
+
+      if (buyTriggered) {
+        if (isEventWatch) {
+          if (currentOpinion === "매수") {
+            return { opinion: "매수", reason: "보유 유지 (이벤트 기간, 기존 매수 유지)", strategyType: savedStrategy };
+          }
+          return { opinion: "관망", reason: "보유 유지 (매수 조건 재충족, 이벤트 기간 — 복원 보류)", strategyType: savedStrategy };
+        }
+        if (
+          currentOpinion === "관망" &&
+          typeof aHoldRestoreAllowed === "function" &&
+          !aHoldRestoreAllowed(stockName, savedStrategy, currentPrice, now, allProperties)
+        ) {
+          return {
+            opinion: "관망",
+            reason: `보유 유지 (${savedStrategy}그룹 복원 대기: 앵커 대비 -${(S.HOLD_RESTORE_DROP * 100).toFixed(0)}% 또는 관망 ${S.HOLD_RESTORE_MIN_TRADING_DAYS}거래일 경과 시 복원)`,
+            strategyType: savedStrategy
+          };
+        }
+        return { opinion: "매수", reason: "보유 유지 (매수 조건 충족 중)", strategyType: savedStrategy };
+      }
+      return { opinion: "관망", reason: "보유 유지 (매수 조건 이탈, 매도 조건 미충족)", strategyType: savedStrategy };
+    }
+
+    const sellTime     = Utils.loadSellTimeFrom(stockName, allProperties);
+    const sellPrice    = Utils.loadSellPriceFrom(stockName, allProperties);
+    const elapsedHours = sellTime ? (now - sellTime) / (1000 * 60 * 60) : S.SELL_HOLD_HOURS + 1;
+
+    let isReentryAllowed = true;
+    if (sellTime) {
+      const daysSinceSell = Utils.calcTradingDays(sellTime, now);
+      if (elapsedHours < S.SELL_HOLD_HOURS) {
+        isReentryAllowed = false;
+      } else if (daysSinceSell <= S.REENTRY_DAYS && !(sellPrice > 0 && currentPrice !== null && currentPrice <= sellPrice * (1 - S.REENTRY_DROP))) {
+        isReentryAllowed = false;
+      }
+    }
+
+    if (currentOpinion === "매도") {
+      if (elapsedHours < S.SELL_HOLD_HOURS) {
+        return {
+          opinion: "매도",
+          reason: nasdaqPeakAlert
+            ? `매도 유지 (나스닥 고점 경고 + ${elapsedHours.toFixed(1)}시간 / 48시간 대기)`
+            : `매도 유지 (${elapsedHours.toFixed(1)}시간 / 48시간 대기)`,
+          strategyType: null
+        };
+      }
+      if (nasdaqPeakAlert) {
+        return { opinion: "관망", reason: "나스닥 고점 경고 유지 — 48시간 경과 후에도 신규/재진입 차단", strategyType: null };
+      }
+      if (buyTriggered && !isEventWatch) {
+        if (isReentryAllowed) return { opinion: "매수", reason: "매도 후 재진입 조건 충족", strategyType: newStrategy };
+        return { opinion: "관망", reason: "매수 조건 충족되나 재진입 쿨다운 중", strategyType: null };
+      }
+      if (isEventWatch) return { opinion: "관망", reason: `이벤트 기간 관망 (${globalData.event})`, strategyType: null };
+      return { opinion: "관망", reason: "매도 후 대기 완료 → 관망 전환", strategyType: null };
+    }
+
+    if (!isEventWatch && !nasdaqPeakAlert && buyTriggered) {
+      if (isReentryAllowed) return { opinion: "매수", reason: "매수 조건 충족", strategyType: newStrategy };
+      return { opinion: "관망", reason: "매수 조건 충족되나 재진입 쿨다운 중", strategyType: null };
+    }
+    if (nasdaqPeakAlert) return { opinion: "관망", reason: "나스닥 고점 경고 유지 — 신규/재진입 차단", strategyType: null };
+    return { opinion: "관망", reason: isEventWatch ? `이벤트 기간 관망 (${globalData.event})` : "매수 조건 미충족", strategyType: null };
+  },
+
+  summarizeChangeReason(fromOpinion, toOpinion, currentGlobalData, lastEvent, row, now, lastReason, allProperties = {}, hintStrategyType = null) {
+    const C            = Utils.COL_INDICES;
+    const S            = Utils.STRATEGY;
+    const stockName    = String(row[C.stockName]).trim();
+    const currentPrice = Utils.toNum(row[C.currentPrice]);
+    const ma200        = Utils.toNum(row[C.ma200]);
+    const rsi          = Utils.toNum(row[C.rsi]);
+    const cci          = Utils.toNum(row[C.cci]);
+    const macdHist     = Utils.toNum(row[C.macdHist]);
+    const macdHistD1   = Utils.toNum(row[C.macdHistD1]);
+    const pctB         = Utils.toNum(row[C.pctB]);
+    const pctBLow      = Utils.toNum(row[C.pctBLow]);
+    const bbWidth      = Utils.toNum(row[C.bbWidth]);
+    const bbWidthD1    = Utils.toNum(row[C.bbWidthD1]);
+    const bbWidthAvg60 = Utils.toNum(row[C.bbWidthAvg60]);
+    const candleLow    = Utils.toNum(row[C.candleLow]);
+    const lrTrendline  = Utils.toNum(row[C.lrTrendline]);
+    const volRatio     = C.volRatio  >= 0 ? Utils.toNum(row[C.volRatio])  : null;
+    const plusDI       = C.plusDI    >= 0 ? Utils.toNum(row[C.plusDI])    : null;
+    const minusDI      = C.minusDI   >= 0 ? Utils.toNum(row[C.minusDI])   : null;
+    const adx          = C.adx       >= 0 ? Utils.toNum(row[C.adx])       : null;
+    const adxD1        = C.adxD1     >= 0 ? Utils.toNum(row[C.adxD1])     : null;
+    const vixToday     = currentGlobalData.vixToday;
+    const ixicDist     = currentGlobalData.ixicDist !== undefined ? currentGlobalData.ixicDist : 100;
+    const ixicFilterActive = currentGlobalData.ixicFilterActive !== undefined
+      ? currentGlobalData.ixicFilterActive
+      : (typeof computeNasdaqABFilterActive === "function" ? computeNasdaqABFilterActive(ixicDist) : ixicDist < S.NASDAQ_DIST_UPPER && ixicDist > S.NASDAQ_DIST_LOWER);
+    const fmt          = v => Number(v).toFixed(2);
+    const fmtP         = v => Utils.fmtPrice(v, stockName);
+
+    const hasRsi = rsi !== null;
+    const hasCci = cci !== null;
+    const rsiOk  = hasRsi && rsi < S.RSI_MAX;
+    const cciOk  = hasCci && cci < S.CCI_MIN;
+    const cond3Released = (hasRsi || hasCci) && !rsiOk && !cciOk;
+
+    const bbPairOk = bbWidth !== null && bbWidthAvg60 !== null && bbWidthAvg60 > 0;
+    const nasdaqAllowsStrictMomentum = !ixicFilterActive && ixicDist >= S.NASDAQ_DIST_UPPER;
+    const nasdaqAllowsBottomBuy = !ixicFilterActive;
+
+    // 그룹 재감지 (현재 지표 기준)
+    const aCond1 = currentPrice !== null && ma200 !== null && currentPrice > ma200;
+    const aCond2 = macdHistD1 !== null && macdHist !== null && macdHistD1 <= 0 && macdHist > 0;
+    const aCond3 = pctB !== null && pctB > S.GOLDEN_CROSS_PCTB_MIN;
+    const aCond4 = rsi !== null && rsi > S.GOLDEN_CROSS_RSI_MIN;
+    const groupA = aCond1 && aCond2 && aCond3 && aCond4 && nasdaqAllowsStrictMomentum;
+
+    const bCond1   = currentPrice !== null && ma200 !== null && currentPrice < ma200;
+    const lrSlope  = (typeof getLRSlope === "function") ? getLRSlope(stockName) : 0;
+    const groupB   = !groupA && bCond1 && (vixToday >= S.VIX_MIN)
+                  && (rsiOk || cciOk) && lrSlope > 0
+                  && lrTrendline !== null && lrTrendline > 0 && candleLow !== null && candleLow <= lrTrendline * 1.03;
+
+    const cCond1   = currentPrice !== null && ma200 !== null && currentPrice > ma200;
+    const cCond2   = bbPairOk && bbWidthD1 !== null && (bbWidthD1 / bbWidthAvg60) < S.SQUEEZE_RATIO;
+    const cCond3   = bbPairOk && bbWidthD1 !== null && bbWidth > bbWidthD1 * S.BB_EXPAND_RATIO;
+    const cCond4   = volRatio !== null && volRatio >= S.SQUEEZE_BREAKOUT_VOL_RATIO;
+    const cCond5   = pctB !== null && pctB > S.SQUEEZE_BREAKOUT_PCTB_MIN;
+    const cCond6   = macdHist !== null && macdHist > 0;
+    const groupC   = !groupA && !groupB && cCond1 && cCond2 && cCond3 && cCond4 && cCond5 && cCond6 && nasdaqAllowsStrictMomentum;
+
+    const dCond1   = currentPrice !== null && ma200 !== null && currentPrice > ma200;
+    const dCond2   = plusDI !== null && minusDI !== null && plusDI > minusDI;
+    const dCond3   = adx !== null && adx > S.ADX_MIN;
+    const dCond4   = adx !== null && adxD1 !== null && adx > adxD1;
+    const dCond5   = macdHist !== null && macdHist > 0;
+    const dCond6   = pctB !== null && pctB >= S.ADX_PCTB_MIN && pctB <= S.ADX_PCTB_MAX;
+    const groupD   = !groupA && !groupB && !groupC && dCond1 && dCond2 && dCond3 && dCond4 && dCond5 && dCond6 && nasdaqAllowsStrictMomentum;
+
+    const eCond1   = currentPrice !== null && ma200 !== null && currentPrice > ma200;
+    const eCond2   = bbPairOk && (bbWidth / bbWidthAvg60) < S.SQUEEZE_RATIO;
+    const eCond3   = pctBLow !== null && pctBLow <= S.SQUEEZE_PCT_B_MAX;
+    const groupE   = !groupA && !groupB && !groupC && !groupD && eCond1 && eCond2 && eCond3 && nasdaqAllowsBottomBuy;
+
+    const fCond1   = currentPrice !== null && ma200 !== null && currentPrice > ma200;
+    const fCond2   = pctBLow !== null && pctBLow <= S.BB_PCT_B_LOW_MAX;
+    const groupF   = !groupA && !groupB && !groupC && !groupD && !groupE && fCond1 && fCond2 && nasdaqAllowsBottomBuy;
+
+    const strategyType = groupA ? "A" : groupB ? "B" : groupC ? "C" : groupD ? "D" : groupE ? "E" : groupF ? "F" : null;
+    const resolvedType = strategyType || hintStrategyType;
+
+    if (fromOpinion === toOpinion) {
+      if (toOpinion === "매수") {
+        const saved     = Utils.loadEntryInfoFrom(stockName, allProperties);
+        const cp        = currentPrice !== null ? currentPrice : 0;
+        const returnPct = saved.price > 0 ? ((cp - saved.price) / saved.price * 100).toFixed(2) : "-";
+        const days      = saved.date ? Utils.calcTradingDays(saved.date, now) : "-";
+        return `보유 유지 (${days}거래일, 수익률 ${returnPct}%, 현재가 ${fmtP(cp)})`;
+      }
+      if (toOpinion === "매도") {
+        const sellTime     = Utils.loadSellTimeFrom(stockName, allProperties);
+        const elapsedHours = sellTime ? ((now - sellTime) / (1000 * 60 * 60)).toFixed(1) : "-";
+        return currentGlobalData.nasdaqPeakAlert
+          ? `매도 유지 (${elapsedHours}시간 경과 / 나스닥 고점 경고로 신규·재진입 차단 중)`
+          : `매도 유지 (${elapsedHours}시간 경과 / 재진입 대기 중)`;
+      }
+      return "관망 유지";
+    }
+
+    if (fromOpinion === "초기값") return "초기값 설정";
+
+    const buildBuyReason = (type) => {
+      const sqRatio = bbPairOk ? ((bbWidth / bbWidthAvg60) * 100).toFixed(1) + "%" : "-";
+      if (type === "A") return `200일선 상방 & 모멘텀 재가속 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)} | 종가 %B ${pctB !== null ? fmt(pctB) : "-"} | RSI ${Utils.fmtNumOrDash(rsi, 2)} | MACD Hist ${Utils.fmtNumOrDash(macdHist, 4)}`;
+      if (type === "B") return `200일선 하방 & 공황 저점 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)} | VIX ${fmt(vixToday)} | RSI ${Utils.fmtNumOrDash(rsi, 2)} / CCI ${Utils.fmtNumOrDash(cci, 2)} | LR추세선 ${lrTrendline !== null ? fmtP(lrTrendline) : "-"} / 저가 ${candleLow !== null ? fmtP(candleLow) : "-"}`;
+      if (type === "C") return `200일선 상방 & 스퀴즈 거래량 돌파 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)} | BB폭 ${bbWidth !== null ? fmt(bbWidth) : "-"} (전일 ${bbWidthD1 !== null ? fmt(bbWidthD1) : "-"} / 60일 ${bbWidthAvg60 !== null ? fmt(bbWidthAvg60) : "-"}) | 거래량비 ${volRatio !== null ? fmt(volRatio) : "-"} | 종가 %B ${pctB !== null ? fmt(pctB) : "-"} | MACD Hist ${Utils.fmtNumOrDash(macdHist, 4)}`;
+      if (type === "D") return `200일선 상방 & 상승 흐름 강화 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)} | +DI ${plusDI !== null ? fmt(plusDI) : "-"} / -DI ${minusDI !== null ? fmt(minusDI) : "-"} | ADX ${adx !== null ? fmt(adx) : "-"} | 종가 %B ${pctB !== null ? fmt(pctB) : "-"} | MACD Hist ${Utils.fmtNumOrDash(macdHist, 4)}`;
+      if (type === "E") return `200일선 상방 & 스퀴즈 저점 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)} | BB폭 ${bbWidth !== null ? fmt(bbWidth) : "-"} / 60일평균 ${bbWidthAvg60 !== null ? fmt(bbWidthAvg60) : "-"} (압축 ${sqRatio}) | 저가 %B ${pctBLow !== null ? fmt(pctBLow) : "-"}`;
+      if (type === "F") return `200일선 상방 & BB 극단 저점 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)} | 저가 %B ${pctBLow !== null ? fmt(pctBLow) : "-"}`;
+      return currentPrice !== null && ma200 !== null && currentPrice > ma200
+        ? `200일선 상방 진입 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)}`
+        : `200일선 하방 진입 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)}`;
+    };
+
+    if (toOpinion === "관망" && currentGlobalData.event !== "당분간 없음" && lastEvent === "당분간 없음")
+      return `이벤트 기간 관망 전환 (${currentGlobalData.event})`;
+
+    if (currentGlobalData.event === "당분간 없음" && lastEvent !== "당분간 없음") {
+      const base = `이벤트 해소 (${lastEvent})`;
+      if (toOpinion === "매수")  return `${base} → ${buildBuyReason(resolvedType)}`;
+      if (toOpinion === "매도")  return `${base} → 매도 조건 충족`;
+      return base;
+    }
+
+    if (toOpinion === "매수") return buildBuyReason(resolvedType);
+    if (toOpinion === "매도") return lastReason || "매도 조건 충족";
+
+    if (toOpinion === "관망") {
+      if (fromOpinion === "매수") {
+        const savedEntry = Utils.loadEntryInfoFrom(stockName, allProperties);
+        const stratType  = savedEntry.strategyType || "A";
+        const rawDeath = ixicDist > S.NASDAQ_DIST_LOWER && ixicDist < S.NASDAQ_DIST_UPPER;
+        let releaseDetail;
+
+        if ((stratType === "E" || stratType === "F") && ixicFilterActive) {
+          releaseDetail = rawDeath
+            ? `나스닥 하락장 필터 진입 (IXIC 이격도 ${ixicDist.toFixed(1)}% → 데스존 ${S.NASDAQ_DIST_UPPER}% ~ ${S.NASDAQ_DIST_LOWER}%)`
+            : `나스닥 E/F 차단 유지 (히스테리시스 IXIC 이격도 ${ixicDist.toFixed(1)}%, 해제 ≥ ${S.NASDAQ_DIST_RELEASE}%)`;
+        } else if (stratType === "A") {
+          releaseDetail = currentPrice <= ma200
+            ? `200일선 하방 이탈 (현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)})`
+            : macdHist === null
+            ? "MACD 히스토그램 일시 결측 (모멘텀 소멸로 단정하지 않음)"
+            : macdHist !== null && macdHist <= 0
+            ? `MACD 골든크로스 소멸 (hist ${Utils.fmtNumOrDash(macdHist, 4)} ≤ 0)`
+            : ixicFilterActive
+            ? (rawDeath
+              ? `나스닥 하락장 필터 진입 — A그룹 차단 (IXIC 이격도 ${ixicDist.toFixed(1)}% → 데스존 ${S.NASDAQ_DIST_UPPER}% ~ ${S.NASDAQ_DIST_LOWER}%)`
+              : `나스닥 하락장 필터 유지 — A그룹 차단 (히스테리시스 IXIC 이격도 ${ixicDist.toFixed(1)}%, 해제 ≥ ${S.NASDAQ_DIST_RELEASE}%)`)
+            : `모멘텀 재가속 조건 이탈 (종가 %B ${pctB !== null ? fmt(pctB) : "-"} / RSI ${Utils.fmtNumOrDash(rsi, 2)})`;
+        } else if (stratType === "B") {
+          releaseDetail = currentPrice >= ma200
+            ? `주가가 200일선 위로 회복 (현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)})`
+            : vixToday < S.VIX_RELEASE ? `시장 공포 수치 완화 (VIX ${fmt(vixToday)} < ${S.VIX_RELEASE})`
+            : (!hasRsi && !hasCci) ? "RSI/CCI 일시 결측 (과매도 해소로 단정하지 않음)"
+            : cond3Released ? `과매도 해소 (RSI ${Utils.fmtNumOrDash(rsi, 2)} / CCI ${Utils.fmtNumOrDash(cci, 2)})`
+            : lrSlope <= 0 ? `추세선 기울기 하락 전환 (기울기 ≤ 0)`
+            : `저가 추세선 이탈 (저가 ${candleLow !== null ? fmtP(candleLow) : "-"} > 추세선 ${lrTrendline !== null ? fmtP(lrTrendline) : "-"} × 1.03)`;
+        } else if (stratType === "C") {
+          releaseDetail = currentPrice <= ma200
+            ? `200일선 하방 이탈 (현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)})`
+            : macdHist === null
+            ? "MACD 히스토그램 일시 결측 (모멘텀 소멸로 단정하지 않음)"
+            : macdHist !== null && macdHist <= 0
+            ? `MACD 소멸 (hist ${Utils.fmtNumOrDash(macdHist, 4)} ≤ 0)`
+            : ixicFilterActive
+            ? (rawDeath
+              ? `나스닥 하락장 필터 진입 — C그룹 차단 (IXIC 이격도 ${ixicDist.toFixed(1)}% → 데스존 ${S.NASDAQ_DIST_UPPER}% ~ ${S.NASDAQ_DIST_LOWER}%)`
+              : `나스닥 하락장 필터 유지 — C그룹 차단 (히스테리시스 IXIC 이격도 ${ixicDist.toFixed(1)}%, 해제 ≥ ${S.NASDAQ_DIST_RELEASE}%)`)
+            : `스퀴즈 거래량 돌파 조건 이탈 (거래량비 ${volRatio !== null ? fmt(volRatio) : "-"} / 종가 %B ${pctB !== null ? fmt(pctB) : "-"})`;
+        } else if (stratType === "D") {
+          releaseDetail = currentPrice <= ma200
+            ? `200일선 하방 이탈 (현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)})`
+            : (plusDI === null || minusDI === null || macdHist === null)
+            ? "DMI/MACD 일시 결측 (추세 약화로 단정하지 않음)"
+            : (plusDI !== null && minusDI !== null && plusDI <= minusDI)
+            ? `DMI 방향 전환 (+DI ${plusDI !== null ? fmt(plusDI) : "-"} ≤ -DI ${minusDI !== null ? fmt(minusDI) : "-"})`
+            : macdHist !== null && macdHist <= 0
+            ? `MACD 소멸 (hist ${Utils.fmtNumOrDash(macdHist, 4)} ≤ 0)`
+            : ixicFilterActive
+            ? (rawDeath
+              ? `나스닥 하락장 필터 진입 — D그룹 차단 (IXIC 이격도 ${ixicDist.toFixed(1)}% → 데스존 ${S.NASDAQ_DIST_UPPER}% ~ ${S.NASDAQ_DIST_LOWER}%)`
+              : `나스닥 하락장 필터 유지 — D그룹 차단 (히스테리시스 IXIC 이격도 ${ixicDist.toFixed(1)}%, 해제 ≥ ${S.NASDAQ_DIST_RELEASE}%)`)
+            : `상승 흐름 조건 이탈 (+DI ${plusDI !== null ? fmt(plusDI) : "-"} / -DI ${minusDI !== null ? fmt(minusDI) : "-"} / MACD Hist ${Utils.fmtNumOrDash(macdHist, 4)})`;
+        } else if (stratType === "E") {
+          const isSqueeze = Utils.calcSqueeze(row);
+          releaseDetail = ixicFilterActive
+            ? (rawDeath
+              ? `나스닥 하락장 필터 진입 (IXIC 이격도 ${ixicDist.toFixed(1)}% → 데스존 ${S.NASDAQ_DIST_UPPER}% ~ ${S.NASDAQ_DIST_LOWER}%)`
+              : `나스닥 E그룹 차단 유지 (히스테리시스 IXIC 이격도 ${ixicDist.toFixed(1)}%, 해제 ≥ ${S.NASDAQ_DIST_RELEASE}%)`)
+            : currentPrice <= ma200
+            ? `200일선 하방 이탈 (현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)})`
+            : !bbPairOk || pctBLow === null
+            ? `BB·저가%B 일시 결측 (스퀴즈 이탈로 단정하지 않음)`
+            : !isSqueeze ? `BB 스퀴즈 해소 (BB폭 ${Utils.fmtNumOrDash(bbWidth, 2)} / 60일평균 ${Utils.fmtNumOrDash(bbWidthAvg60, 2)})`
+            : `저가 %B 상승 (${Utils.fmtNumOrDash(pctBLow, 2)} > ${S.SQUEEZE_PCT_B_MAX})`;
+        } else {
+          // F그룹
+          releaseDetail = ixicFilterActive
+            ? (rawDeath
+              ? `나스닥 하락장 필터 진입 (IXIC 이격도 ${ixicDist.toFixed(1)}% → 데스존 ${S.NASDAQ_DIST_UPPER}% ~ ${S.NASDAQ_DIST_LOWER}%)`
+              : `나스닥 F그룹 차단 유지 (히스테리시스 IXIC 이격도 ${ixicDist.toFixed(1)}%, 해제 ≥ ${S.NASDAQ_DIST_RELEASE}%)`)
+            : currentPrice <= ma200
+            ? `200일선 하방 이탈 (현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)})`
+            : pctBLow !== null
+            ? `BB 하단 눌림 해소 (저가 %B ${Utils.fmtNumOrDash(pctBLow, 2)} > ${S.BB_PCT_B_LOW_MAX})`
+            : `저가 %B 일시 결측 (눌림 해소로 단정하지 않음)`;
+        }
+        return `매수 조건 해제 — ${releaseDetail} (보유 중 계속 추적)`;
+      }
+      if (fromOpinion === "매도") {
+        if (currentGlobalData.nasdaqPeakAlert) {
+          return "나스닥 고점 경고 유지 중 48시간 경과 → 관망 전환 (신규/재진입 차단 유지)";
+        }
+        return "매도 후 대기 완료 → 관망 전환 (재진입 필터 유지)";
+      }
+      return "관망 전환";
+    }
+    return "투자의견 변경";
+  },
+
+  getLatestTrendData(targetSheet) {
+    try {
+      const trendSheet = targetSheet.getParent().getSheetByName("시장트렌드");
+      if (!trendSheet || trendSheet.getLastRow() < 2) return null;
+      const row   = trendSheet.getRange(trendSheet.getLastRow(), 1, 1, 12).getValues()[0];
+      const ranks = [];
+      for (let i = 1; i <= 10; i++) {
+        const cell  = String(row[i] || "").trim();
+        if (!cell || cell === "-") continue;
+        const parts = cell.split("|");
+        ranks.push({ rank: i, sector: (parts[0] || "").trim(), keywords: (parts[1] || "").trim() });
+      }
+      return { date: row[0], ranks, summary: String(row[11] || "") };
+    } catch (e) {
+      console.log(`[getLatestTrendData 오류] ${e}`);
+      return null;
+    }
+  },
+
+  buildIndustryMap(targetSheet) {
+    try {
+      const valueSheet = targetSheet.getParent().getSheetByName("가치분석");
+      if (!valueSheet || valueSheet.getLastRow() < 2) return {};
+      const map = {};
+      valueSheet.getRange(2, 1, valueSheet.getLastRow() - 1, 4).getValues().forEach(row => {
+        const ticker   = String(row[0]).trim();
+        const industry = String(row[3]).trim();
+        if (ticker && industry) map[ticker] = industry;
+      });
+      return map;
+    } catch (e) {
+      console.log(`[buildIndustryMap 오류] ${e}`);
+      return {};
+    }
+  },
+
+  buildTrendBadge(industryStr, trendData) {
+    const ranks = trendData && trendData.ranks;
+    if (!industryStr || !trendData || !ranks) return null;
+    if (!ranks.length) return null;
+
+    const iKeys = industryStr
+      .split(/[,·\/]+/)
+      .map(k => k.trim())
+      .filter(k => k.length >= 2 && !Utils._isGenericTrendToken(k));
+    let bestRank = 999, bestSector = "", bestKeyword = "";
+    ranks.forEach(r => {
+      const tKeys = [r.sector]
+        .concat(String(r.keywords || "").split(/[,\|·\/]+/))
+        .map(k => k.trim())
+        .filter(k => k.length >= 2 && !Utils._isGenericTrendToken(k));
+      iKeys.forEach(ik => {
+        tKeys.forEach(tk => {
+          if (Utils._trendTokensMatch(ik, tk) && r.rank < bestRank) {
+            bestRank = r.rank;
+            bestSector = r.sector;
+            bestKeyword = ik;
+          }
+        });
+      });
+    });
+
+    if (bestRank < 999) {
+      const fire      = bestRank <= 3 ? "[주도]" : bestRank <= 6 ? "[강세]" : "[주시]";
+      const kwDisplay = bestKeyword && bestKeyword !== bestSector ? ` (${bestKeyword})` : "";
+      return `${fire} 이번 주 ${bestRank}위 — ${bestSector}${kwDisplay}`;
+    }
+    return "[트렌드] 순위표에 직접 매칭 없음";
+  },
+
+  getTradingLogSheet() {
+    const sheet         = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("기술분석");
+    const spreadsheetId = sheet.getRange("I1").getValue();
+    if (!spreadsheetId) {
+      console.log("[트레이딩로그] I1이 비어 있음 — 트레이딩로그 스프레드시트 ID를 기술분석 시트 I1에 입력하세요");
+      return null;
+    }
+    if (Utils._tradingLogSheetCache && Utils._tradingLogSheetCacheId === String(spreadsheetId)) {
+      return Utils._tradingLogSheetCache;
+    }
+    try {
+      const targetSpreadsheet = SpreadsheetApp.openById(spreadsheetId);
+      let logSheet = targetSpreadsheet.getSheetByName("트레이딩로그");
+      if (!logSheet) {
+        logSheet = targetSpreadsheet.insertSheet("트레이딩로그");
+        logSheet.getRange(1, 1, 1, 6).setValues([["종목", "매수 날짜", "매수 가격", "매도 날짜", "매도 가격", "기준"]]);
+        logSheet.setFrozenRows(1);
+        logSheet.setColumnWidths(1, 6, 120);
+      }
+      Utils._tradingLogSheetCache = logSheet;
+      Utils._tradingLogSheetCacheId = String(spreadsheetId);
+      Utils._nextTradingLogRowCache = null;
+      return logSheet;
+    } catch (e) {
+      console.log(`ERROR: 트레이딩 로그 시트 접근 실패. 오류: ${e}`);
+      return null;
+    }
+  },
+
+  getNextTradingLogRow(logSheet) {
+    if (Utils._nextTradingLogRowCache !== null) return Utils._nextTradingLogRowCache;
+    const nextRow = Utils.findFirstEmptyRow(logSheet);
+    Utils._nextTradingLogRowCache = nextRow;
+    return nextRow;
+  },
+
+  findFirstEmptyRow(logSheet) {
+    const lastRow = logSheet.getLastRow();
+    if (lastRow < 3) return 3;
+    // 1행은 헤더, 2행은 안내/요약 텍스트로 사용하므로 3행부터만 로그 데이터로 취급.
+    // G열 이후 수식/서식이 길게 깔려 있어 getLastRow()가 과대평가될 수 있으므로
+    // 실제 로그 영역인 A:F만 기준으로 첫 빈 행을 찾는다.
+    const data = logSheet.getRange(3, 1, lastRow - 2, 6).getDisplayValues();
+    for (let i = 0; i < data.length; i++) {
+      const row = data[i];
+      const hasData = row.some(cell => String(cell || "").trim() !== "");
+      if (!hasData) return i + 3;
+    }
+    return lastRow + 1;
+  },
+
+  // ── 멀티 슬롯 관리 ─────────────────────────────────────────────────────────
+  // SLOT_${stockName}_${strategy}: "price|dateStr"
+  // SLOT_SELL_${stockName}_${strategy}: "dateStr|sellPrice"
+
+  loadSlot(stockName, strategy, allProperties) {
+    const key = `SLOT_${stockName}_${strategy}`;
+    const val = allProperties[key];
+    if (!val) return null;
+    const [priceStr, dateStr] = val.split("|");
+    const price = Number(priceStr) || 0;
+    if (!price) return null;
+    return { price, date: Utils.parseDateKST(dateStr), strategy };
+  },
+
+  saveSlot(stockName, strategy, price, dateStr, props) {
+    Utils.clearSlotUpperExitArm(stockName, strategy, props);
+    props.setProperty(`SLOT_${stockName}_${strategy}`, `${price}|${dateStr}`);
+  },
+
+  clearSlot(stockName, strategy, props) {
+    props.deleteProperty(`SLOT_${stockName}_${strategy}`);
+    Utils.clearSlotUpperExitArm(stockName, strategy, props);
+    // 매도 이력 기록 (재진입 쿨다운용) — 별도 저장은 processMultiSlots에서 처리
+  },
+
+  saveSlotUpperExitArm(stockName, strategy, date, props) {
+    const value = Utilities.formatDate(date, "Asia/Seoul", "yyyy-MM-dd'T'HH:mm:ss") + "+09:00";
+    (props || PropertiesService.getScriptProperties()).setProperty(`SLOT_UPPER_EXIT_ARM_${stockName}_${strategy}`, value);
+  },
+
+  loadSlotUpperExitArm(stockName, strategy, allProperties) {
+    const key   = `SLOT_UPPER_EXIT_ARM_${stockName}_${strategy}`;
+    const value = allProperties && allProperties[key];
+    return value ? Utils.parseDateKST(value) : null;
+  },
+
+  clearSlotUpperExitArm(stockName, strategy, props) {
+    (props || PropertiesService.getScriptProperties()).deleteProperty(`SLOT_UPPER_EXIT_ARM_${stockName}_${strategy}`);
+  },
+
+  // 슬롯 진입 조건 체크 (strategy별 독립 평가 — 주 전략 제외 없음)
+  evaluateSlotEntry(row, globalData, strategy, stockName) {
+    const C            = Utils.COL_INDICES;
+    const S            = Utils.STRATEGY;
+    const currentPrice = Utils.toNum(row[C.currentPrice]);
+    const ma200        = Utils.toNum(row[C.ma200]);
+    const rsi          = Utils.toNum(row[C.rsi]);
+    const cci          = Utils.toNum(row[C.cci]);
+    const pctBLow      = Utils.toNum(row[C.pctBLow]);
+    const pctB         = Utils.toNum(row[C.pctB]);
+    const bbWidth      = Utils.toNum(row[C.bbWidth]);
+    const bbWidthD1    = Utils.toNum(row[C.bbWidthD1]);
+    const bbWidthAvg60 = Utils.toNum(row[C.bbWidthAvg60]);
+    const macdHist     = Utils.toNum(row[C.macdHist]);
+    const macdHistD1   = Utils.toNum(row[C.macdHistD1]);
+    const candleLow    = Utils.toNum(row[C.candleLow]);
+    const lrTrendline  = Utils.toNum(row[C.lrTrendline]);
+    const volRatio     = C.volRatio  >= 0 ? Utils.toNum(row[C.volRatio])  : null;
+    const plusDI       = C.plusDI    >= 0 ? Utils.toNum(row[C.plusDI])    : null;
+    const minusDI      = C.minusDI   >= 0 ? Utils.toNum(row[C.minusDI])   : null;
+    const adx          = C.adx       >= 0 ? Utils.toNum(row[C.adx])       : null;
+    const adxD1        = C.adxD1     >= 0 ? Utils.toNum(row[C.adxD1])     : null;
+    const { ixicFilterActive, ixicDist, nasdaqPeakAlert, vixToday } = globalData;
+    const isEventWatch = globalData.event !== "당분간 없음";
+
+    if (!currentPrice || !ma200) return false;
+    if (nasdaqPeakAlert || isEventWatch) return false;
+
+    const bbPairOk                 = bbWidth !== null && bbWidthAvg60 !== null && bbWidthAvg60 > 0;
+    const nasdaqAllowsStrictMomentum = !ixicFilterActive && (ixicDist !== undefined ? ixicDist : 100) >= S.NASDAQ_DIST_UPPER;
+    const nasdaqAllowsBottomBuy    = !ixicFilterActive;
+    const hasRsi = rsi !== null, hasCci = cci !== null;
+    const rsiOk  = hasRsi && rsi < S.RSI_MAX;
+    const cciOk  = hasCci && cci < S.CCI_MIN;
+    const cond3  = rsiOk || cciOk;
+
+    if (strategy === "A") {
+      return currentPrice > ma200
+        && macdHistD1 !== null && macdHist !== null && macdHistD1 <= 0 && macdHist > 0
+        && pctB !== null && pctB > S.GOLDEN_CROSS_PCTB_MIN
+        && rsi !== null && rsi > S.GOLDEN_CROSS_RSI_MIN
+        && nasdaqAllowsStrictMomentum;
+    }
+    if (strategy === "B") {
+      const lrSlope = (typeof getLRSlope === "function") ? getLRSlope(stockName) : 0;
+      return currentPrice < ma200
+        && vixToday >= S.VIX_MIN && cond3 && lrSlope > 0
+        && lrTrendline !== null && lrTrendline > 0
+        && candleLow !== null && candleLow <= lrTrendline * 1.03;
+    }
+    if (strategy === "C") {
+      return currentPrice > ma200
+        && bbPairOk && bbWidthD1 !== null && (bbWidthD1 / bbWidthAvg60) < S.SQUEEZE_RATIO
+        && bbWidth > bbWidthD1 * S.BB_EXPAND_RATIO
+        && volRatio !== null && volRatio >= S.SQUEEZE_BREAKOUT_VOL_RATIO
+        && pctB !== null && pctB > S.SQUEEZE_BREAKOUT_PCTB_MIN
+        && macdHist !== null && macdHist > 0
+        && nasdaqAllowsStrictMomentum;
+    }
+    if (strategy === "D") {
+      return currentPrice > ma200
+        && plusDI !== null && minusDI !== null && plusDI > minusDI
+        && adx !== null && adx > S.ADX_MIN
+        && adx !== null && adxD1 !== null && adx > adxD1
+        && macdHist !== null && macdHist > 0
+        && pctB !== null && pctB >= S.ADX_PCTB_MIN && pctB <= S.ADX_PCTB_MAX
+        && nasdaqAllowsStrictMomentum;
+    }
+    if (strategy === "E") {
+      return currentPrice > ma200
+        && bbPairOk && (bbWidth / bbWidthAvg60) < S.SQUEEZE_RATIO
+        && pctBLow !== null && pctBLow <= S.SQUEEZE_PCT_B_MAX
+        && nasdaqAllowsBottomBuy;
+    }
+    if (strategy === "F") {
+      return currentPrice > ma200
+        && pctBLow !== null && pctBLow <= S.BB_PCT_B_LOW_MAX
+        && nasdaqAllowsBottomBuy;
+    }
+    return false;
+  },
+
+  // 슬롯 청산 조건 체크 (주 전략과 동일한 익절/손절/보유기간 규칙 적용)
+  evaluateSlotExit(row, globalData, now, slot, strategy, allProperties) {
+    const C            = Utils.COL_INDICES;
+    const S            = Utils.STRATEGY;
+    const stockName    = String(row[C.stockName]).trim();
+    const currentPrice = Utils.toNum(row[C.currentPrice]);
+    if (!currentPrice || !slot.price) return null;
+
+    const macdHist     = Utils.toNum(row[C.macdHist]);
+    const macdHistD1   = Utils.toNum(row[C.macdHistD1]);
+    const macdHistD2   = Utils.toNum(row[C.macdHistD2]);
+    const returnPct   = (currentPrice - slot.price) / slot.price;
+    const tradingDays = Utils.calcTradingDays(slot.date, now);
+    const targetPct   = strategy === "A" ? S.TARGET_PCT_A
+                      : strategy === "B" ? S.TARGET_PCT_B
+                      : strategy === "C" ? S.TARGET_PCT_C
+                      : strategy === "D" ? S.TARGET_PCT_D
+                      : strategy === "E" ? S.TARGET_PCT_E
+                      : S.TARGET_PCT_F;
+    const circuitPct  = strategy === "A" ? S.CIRCUIT_PCT_A
+                      : strategy === "B" ? S.CIRCUIT_PCT_B
+                      : strategy === "C" ? S.CIRCUIT_PCT_C
+                      : strategy === "D" ? S.CIRCUIT_PCT_D
+                      : strategy === "E" ? S.CIRCUIT_PCT_E
+                      : S.CIRCUIT_PCT_F;
+    const label       = strategy === "A" ? "200일선 상방 & 모멘텀 재가속"
+                      : strategy === "B" ? "200일선 하방 & 공황 저점"
+                      : strategy === "C" ? "200일선 상방 & 스퀴즈 거래량 돌파"
+                      : strategy === "D" ? "200일선 상방 & 상승 흐름 강화"
+                      : strategy === "E" ? "200일선 상방 & 스퀴즈 저점"
+                      : "200일선 상방 & BB 극단 저점";
+    const isEfStrategy = strategy === "E" || strategy === "F";
+    let upperExitArmDate = isEfStrategy ? Utils.loadSlotUpperExitArm(stockName, strategy, allProperties) : null;
+
+    if (globalData.nasdaqPeakAlert)              return { reason: `나스닥 고점 경고 — 강제 매도 [${label}]` };
+    if (returnPct <= -circuitPct)                return { reason: `손절 기준 도달 -${Math.abs(returnPct * 100).toFixed(2)}% [${label}]` };
+
+    if (isEfStrategy && returnPct >= targetPct && !upperExitArmDate) {
+      Utils.saveSlotUpperExitArm(stockName, strategy, now);
+      upperExitArmDate = now;
+    }
+
+    if (isEfStrategy && upperExitArmDate) {
+      const histTurnSignal =
+        macdHist !== null && macdHistD1 !== null && macdHistD2 !== null &&
+        (macdHist - macdHistD1) < (macdHistD1 - macdHistD2);
+      const waitDays = Utils.calcTradingDays(upperExitArmDate, now);
+      if (returnPct >= targetPct && histTurnSignal) {
+        return { reason: `목표 수익 구간 + MACD 히스토그램 둔화전환 매도 +${(returnPct * 100).toFixed(2)}% [${label}]` };
+      }
+      if (waitDays >= S.UPPER_EXIT_MAX_WAIT_DAYS) {
+        return { reason: `목표 수익 도달 후 ${S.UPPER_EXIT_MAX_WAIT_DAYS}거래일 대기 만료 매도 ${(returnPct * 100).toFixed(2)}% [${label}]` };
+      }
+    }
+
+    if (!isEfStrategy && returnPct >= targetPct) return { reason: `목표 수익 달성 +${(returnPct * 100).toFixed(2)}% [${label}]` };
+    if (tradingDays >= S.HALF_EXIT_DAYS && returnPct > 0) return { reason: `60거래일 경과 + 수익 중 [${label}]` };
+    if (tradingDays >= S.MAX_HOLD_DAYS)          return { reason: `최대 보유 기간 초과 [${label}]` };
+    return null;
+  },
+
+  // 슬롯용 매도 로그 (전략 레이블 기준으로 특정 행만 업데이트)
+  recordSlotSellSignal(stockName, strategy, sellDate, sellPrice) {
+    const logSheet = Utils.getTradingLogSheet();
+    if (!logSheet) { console.log(`[슬롯 매도 로깅 실패] ${stockName} ${strategy}그룹: 시트 없음`); return; }
+    const lastRow = logSheet.getLastRow();
+    if (lastRow < 3) return;
+    const data = logSheet.getRange(3, 1, lastRow - 2, 6).getValues();
+
+    const targetLabel = strategyDisplayName(strategy);
+    const normalizeLabel = (l) => String(l || "").replace(/^[A-F]\.\s*/, "").trim();
+
+    for (let i = 0; i < data.length; i++) {
+      if (String(data[i][0]).trim() === stockName
+          && !data[i][3]
+          && normalizeLabel(data[i][5]) === normalizeLabel(targetLabel)) {
+        try {
+          logSheet.getRange(i + 3, 4).setValue(sellDate);
+          Utils.setTradingLogPriceCell(logSheet.getRange(i + 3, 5), stockName, sellPrice);
+          console.log(`[슬롯 매도 로깅] ${stockName} ${strategy}그룹 → ${i + 3}행`);
+        } catch (e) { console.log(`[슬롯 매도 로깅 실패] ${stockName}: ${e}`); }
+        return;
+      }
+    }
+    console.log(`[슬롯 매도 로깅 건너띔] ${stockName} ${strategy}그룹: 매칭 행 없음`);
+  },
+
+  // 슬롯 매수 이유 문자열 생성
+  buildSlotBuyReason(strategy, row, globalData) {
+    const C            = Utils.COL_INDICES;
+    const S            = Utils.STRATEGY;
+    const currentPrice = Utils.toNum(row[C.currentPrice]);
+    const ma200        = Utils.toNum(row[C.ma200]);
+    const pctBLow      = Utils.toNum(row[C.pctBLow]);
+    const pctB         = Utils.toNum(row[C.pctB]);
+    const bbWidth      = Utils.toNum(row[C.bbWidth]);
+    const bbWidthD1    = Utils.toNum(row[C.bbWidthD1]);
+    const bbWidthAvg60 = Utils.toNum(row[C.bbWidthAvg60]);
+    const rsi          = Utils.toNum(row[C.rsi]);
+    const cci          = Utils.toNum(row[C.cci]);
+    const macdHist     = Utils.toNum(row[C.macdHist]);
+    const candleLow    = Utils.toNum(row[C.candleLow]);
+    const lrTrendline  = Utils.toNum(row[C.lrTrendline]);
+    const volRatio     = C.volRatio  >= 0 ? Utils.toNum(row[C.volRatio])  : null;
+    const plusDI       = C.plusDI    >= 0 ? Utils.toNum(row[C.plusDI])    : null;
+    const minusDI      = C.minusDI   >= 0 ? Utils.toNum(row[C.minusDI])   : null;
+    const adx          = C.adx       >= 0 ? Utils.toNum(row[C.adx])       : null;
+    const stockName    = String(row[C.stockName]).trim();
+    const fmtP         = v => Utils.fmtPrice(v, stockName);
+    const fmt          = (v, d) => v !== null ? Number(v).toFixed(d) : "-";
+
+    if (strategy === "A") {
+      return `모멘텀 재가속 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)} | 종가 %B ${fmt(pctB, 2)} | RSI ${fmt(rsi, 1)} | MACD hist ${fmt(macdHist, 4)}`;
+    }
+    if (strategy === "B") {
+      return `공황 저점 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)} | VIX ${globalData.vixToday !== undefined ? globalData.vixToday.toFixed(2) : "-"} | RSI ${fmt(rsi, 1)} / CCI ${fmt(cci, 1)} | LR추세선 ${fmtP(lrTrendline)} / 저가 ${fmtP(candleLow)}`;
+    }
+    if (strategy === "C") {
+      const sqRatio = (bbWidthD1 !== null && bbWidthAvg60 !== null && bbWidthAvg60 > 0)
+        ? ((bbWidthD1 / bbWidthAvg60) * 100).toFixed(1) + "%" : "-";
+      return `스퀴즈 거래량 돌파 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)} | BB폭 ${fmt(bbWidth, 2)} (전일 ${fmt(bbWidthD1, 2)} / 60일 ${fmt(bbWidthAvg60, 2)}) | 거래량비 ${fmt(volRatio, 2)} | 종가 %B ${fmt(pctB, 2)}`;
+    }
+    if (strategy === "D") {
+      return `상승 흐름 강화 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)} | +DI ${fmt(plusDI, 2)} / -DI ${fmt(minusDI, 2)} | ADX ${fmt(adx, 2)} | 종가 %B ${fmt(pctB, 2)} | MACD hist ${fmt(macdHist, 4)}`;
+    }
+    if (strategy === "E") {
+      const sqRatio = (bbWidth !== null && bbWidthAvg60 !== null && bbWidthAvg60 > 0)
+        ? ((bbWidth / bbWidthAvg60) * 100).toFixed(1) + "%" : "-";
+      return `스퀴즈 저점 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)} | BB폭 압축 ${sqRatio} | 저가 %B ${fmt(pctBLow, 2)}`;
+    }
+    return `BB 극단 저점 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)} | 저가 %B ${fmt(pctBLow, 2)}`;
+  },
+
+  recordBuySignal(stockName, buyDate, buyPrice, strategyLabel) {
+    console.log(`[로깅 시도] 매수: ${stockName} / 가격: ${buyPrice} / 전략: ${strategyLabel} / 날짜: ${buyDate}`);
+    const logSheet = Utils.getTradingLogSheet();
+    if (!logSheet) {
+      console.log(`[로깅 실패] ${stockName}: 트레이딩로그 시트 접근 불가 — I1 셀의 스프레드시트 ID를 확인하세요`);
+      return;
+    }
+    try {
+      const row = Utils.getNextTradingLogRow(logSheet);
+      console.log(`[로깅 대상 행] ${stockName}: ${row}행`);
+      logSheet.getRange(row, 1, 1, 6).setValues([[stockName, buyDate, "", "", "", strategyLabel]]);
+      Utils.setTradingLogPriceCell(logSheet.getRange(row, 3), stockName, buyPrice);
+      SpreadsheetApp.flush();
+      Utils._nextTradingLogRowCache = row + 1;
+      console.log(`[로깅 완료] 매수: ${stockName} ${Utils.fmtPrice(buyPrice, stockName)} (${strategyLabel}) → ${row}행`);
+    } catch (e) {
+      console.log(`[로깅 실패] ${stockName}: ${e.message || e}`);
+    }
+  },
+
+  recordSellSignal(stockName, sellDate, sellPrice, strategyLabel) {
+    const logSheet = Utils.getTradingLogSheet();
+    if (!logSheet) { console.log(`[로깅 실패] ${stockName}: 시트 없음`); return; }
+    const lastRow = logSheet.getLastRow();
+    if (lastRow < 3) return;
+    const data         = logSheet.getRange(3, 1, lastRow - 2, 6).getValues();
+    const normalizeLabel = (l) => String(l || "").replace(/^[A-F]\.\s*/, "").trim();
+    let updateCount    = 0;
+    for (let i = 0; i < data.length; i++) {
+      if (String(data[i][0]).trim() === stockName && !data[i][3]) {
+        if (strategyLabel && normalizeLabel(data[i][5]) !== normalizeLabel(strategyLabel)) continue;
+        try {
+          logSheet.getRange(i + 3, 4).setValue(sellDate);
+          Utils.setTradingLogPriceCell(logSheet.getRange(i + 3, 5), stockName, sellPrice);
+          updateCount++;
+          console.log(`[로깅] 매도: ${stockName} ${Utils.fmtPrice(sellPrice, stockName)} 행:${i + 3}`);
+        } catch (e) { console.log(`[로깅 실패] ${stockName} 행${i + 3}: ${e}`); }
+      }
+    }
+    if (updateCount === 0) console.log(`[로깅 건너띔] ${stockName}: 청산할 매수 기록 없음`);
+  },
+
+  sendEmailAlert(recipientEmail, changes, buyOpinions, sellOpinions, kstDate, estString) {
+    const stockSymbols = changes.map(c => c.ticker).join(", ");
+    const changesHtml  = changes.map((c, i) => {
+      const isBuySignal  = c.to === "매수" || c.to.includes("매수");
+      const isSellSignal = c.to === "매도" || c.to.includes("매도");
+      const borderColor = isBuySignal ? "#2ecc71" : isSellSignal ? "#e74c3c" : "#95a5a6";
+      const toColor     = isBuySignal ? "#27ae60" : isSellSignal ? "#c0392b" : "#7f8c8d";
+      let entryNoteHtml = "";
+      if (c.entryNote) {
+        const isNew      = c.entryNote === "신규 진입";
+        const isReent    = c.entryNote.indexOf("재진입") === 0;
+        const isConcurr  = c.entryNote.indexOf("병행 진입") === 0;
+        const noteColor  = isNew ? "#2980b9" : isReent ? "#e67e22" : isConcurr ? "#27ae60" : "#7f8c8d";
+        entryNoteHtml = `<br><span style="font-size:12px;color:${noteColor};">${c.entryNote}</span>`;
+      }
+      return (
+        `<div style="margin-bottom:8px;padding:8px;background:#f9f9f9;border-left:3px solid ${borderColor};">` +
+        `${i + 1}. <strong>${c.stock}</strong> &nbsp;<span style="color:#888;">'${c.from}'</span> → <strong style="color:${toColor};">${c.to}</strong><br>` +
+        `<span style="font-size:13px;">이유: ${c.reason}</span><br>` +
+        `<span style="font-size:13px;">현재가: <strong>${c.price}</strong></span>` +
+        entryNoteHtml +
+        (c.industry   ? `<br><span style="font-size:12px;color:#666;">산업: ${c.industry}</span>` : "") +
+        (c.trendBadge ? `<br><span style="font-size:12px;color:#e67e22;">${c.trendBadge}</span>` : "") +
+        `</div>`
+      );
+    }).join("");
+
+    const emailBody = `
+    <div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.6;max-width:600px;">
+      <p style="font-size:16px;font-weight:bold;color:#333;border-bottom:2px solid #eee;padding-bottom:8px;">투자의견이 변경된 종목이 있습니다.</p>
+      <div>${changesHtml}</div><br>
+      <p style="margin:0;"><strong>현재 매수 의견 종목:</strong> ${buyOpinions.length > 0 ? buyOpinions.join(", ") : "없음"}</p>
+      <p style="margin:0;"><strong>현재 매도 의견 종목:</strong> ${sellOpinions.length > 0 ? sellOpinions.join(", ") : "없음"}</p><br>
+      <p style="color:#888;font-size:12px;">발송 시각 (한국): ${kstDate}<br>발송 시각 (미 동부): ${estString}</p>
+    </div>`;
+
+    try {
+      if (recipientEmail && recipientEmail.length > 0) {
+        GmailApp.sendEmail(recipientEmail, `투자의견 변경 알림 (${stockSymbols})`, "", { htmlBody: emailBody });
+        console.log(`[이메일 발송] ${stockSymbols} → ${recipientEmail}`);
+      } else { console.log("[이메일 실패] F1 셀 이메일 주소 없음"); }
+    } catch (e) { console.log(`[이메일 FATAL] ${e}`); }
+  }
+};
+
+/**
+ * 트레이딩 로그에서 특정 종목+전략의 잘못 입력된 매도 데이터를 삭제합니다.
+ * 실행 후 이 함수를 제거하거나 주석 처리하세요.
+ * 
+ * 사용법: 아래 호출부를 수정하여 stockName, strategyCode를 지정합니다.
+ *   fixTradingLogSellData("247540", "C")
+ */
+function fixTradingLogSellData(stockName, strategyCode) {
+  if (!stockName || !strategyCode) {
+    console.log("[복구 실패] stockName과 strategyCode를 인수로 전달하세요.");
+    return;
+  }
+  const logSheet = Utils.getTradingLogSheet();
+  if (!logSheet) { console.log("[복구 실패] 트레이딩 로그 시트를 찾을 수 없습니다."); return; }
+
+  const lastRow = logSheet.getLastRow();
+  if (lastRow < 3) { console.log("[복구] 데이터 없음"); return; }
+
+  const data = logSheet.getRange(3, 1, lastRow - 2, 6).getValues();
+  const normalizeLabel = (l) => String(l || "").replace(/^[A-F]\.\s*/, "").trim();
+  const targetLabel = Utils.getDisplayName
+    ? strategyCode
+    : strategyCode;
+
+  // 전략 라벨 매칭 문자열 (예: "스퀴즈 거래량 돌파")
+  const strategyNames = {
+    A: "모멘텀 재가속",
+    B: "공황 저점",
+    C: "스퀴즈 거래량 돌파",
+    D: "상승 흐름 강화",
+    E: "스퀴즈 저점",
+    F: "BB 극단 저점"
+  };
+  const targetLabelNorm = strategyNames[strategyCode.toUpperCase()] || strategyCode;
+
+  let fixCount = 0;
+  for (let i = 0; i < data.length; i++) {
+    const ticker   = String(data[i][0]).trim();
+    const sellDate = data[i][3];
+    const logLabel = String(data[i][5] || "");
+    if (ticker !== stockName) continue;
+    if (!sellDate) continue; // 매도 기록 없는 행은 스킵
+    if (normalizeLabel(logLabel) !== targetLabelNorm) continue; // 전략 불일치는 스킵
+
+    // 매도 날짜(D열=4)와 매도 가격(E열=5) 삭제
+    logSheet.getRange(i + 3, 4).clearContent();
+    logSheet.getRange(i + 3, 5).clearContent();
+    fixCount++;
+    console.log(`[복구 완료] ${stockName} ${strategyCode}그룹 → 행 ${i + 3} 매도 데이터 삭제`);
+  }
+
+  if (fixCount === 0) {
+    console.log(`[복구] ${stockName} ${strategyCode}그룹: 정정할 매도 기록 없음 (이미 정상 상태거나 해당 행 없음)`);
+  } else {
+    console.log(`[복구 완료] 총 ${fixCount}건 정정됨`);
+  }
+
+  // SLOT_ 키 상태 확인
+  const props    = PropertiesService.getScriptProperties();
+  const slotKey  = `SLOT_${stockName}_${strategyCode.toUpperCase()}`;
+  const slotVal  = props.getProperty(slotKey);
+  if (slotVal) {
+    console.log(`[SLOT 확인] ${slotKey} = ${slotVal} (포지션 키 존재 - 정상)`);
+  } else {
+    console.log(`[SLOT 확인] ${slotKey} 없음 (포지션이 실제로 없거나 이미 삭제됨)`);
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 트레이딩 로그 전략 레이블 수정: ASTS F→D 오기록 정정
+// 실행 후 이 함수를 삭제하거나 주석 처리하세요.
+// ──────────────────────────────────────────────────────────────────────────────
+/**
+ * ASTS 트레이딩 로그에서 F 전략으로 잘못 기록된 매수 행의 전략 레이블을 D로 수정합니다.
+ * evaluatedStrategyType || "F" 버그로 인해 발생한 오기록입니다.
+ */
+function fixASTSStrategyLabel() {
+  const logSheet = Utils.getTradingLogSheet();
+  if (!logSheet) { console.log("[복구 실패] 트레이딩 로그 시트를 찾을 수 없습니다."); return; }
+
+  const lastRow = logSheet.getLastRow();
+  if (lastRow < 3) { console.log("[복구] 데이터 없음"); return; }
+
+  const data = logSheet.getRange(3, 1, lastRow - 2, 6).getValues();
+  const normalizeLabel = (l) => String(l || "").replace(/^[A-F]\.\s*/, "").trim();
+  const wrongLabel  = "BB 극단 저점"; // F 전략 레이블
+  const correctLabel = "D. 200일선 상방 & 상승 흐름 강화";
+
+  let fixCount = 0;
+  for (let i = 0; i < data.length; i++) {
+    const ticker = String(data[i][0]).trim();
+    if (ticker !== "ASTS") continue;
+    if (data[i][3]) continue; // 이미 매도 처리된 행은 스킵
+
+    const currentLabel = String(data[i][5] || "");
+    if (normalizeLabel(currentLabel) !== wrongLabel) continue;
+
+    logSheet.getRange(i + 3, 6).setValue(correctLabel);
+    fixCount++;
+    console.log(`[수정 완료] ASTS 행 ${i + 3}: 전략 레이블 "${currentLabel}" → "${correctLabel}"`);
+  }
+
+  if (fixCount === 0) {
+    console.log("[수정] ASTS: 수정할 F 전략 레이블 없음 (이미 정상이거나 해당 행 없음)");
+  } else {
+    console.log(`[수정 완료] ASTS 총 ${fixCount}건 정정됨`);
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// LIG디펜스 D전략 포지션 미청산 수정
+// 실행 후 이 함수를 삭제하거나 주석 처리하세요.
+// ──────────────────────────────────────────────────────────────────────────────
+/**
+ * LIG디펜스(079550) 트레이딩 로그에서 D전략으로 열려 있는 행을 닫고 (매도 데이터 기입),
+ * A전략 매수 행이 없으면 새로 추가합니다.
+ *
+ * 사용 전에 아래 상수를 실제 값으로 확인/수정하세요:
+ *   D_SELL_DATE  : D포지션 청산일 (A전략 진입일 = "2026-04-22")
+ *   D_SELL_PRICE : D포지션 청산 가격 (A전략 진입 시점의 LIG 가격, 실제 확인 필요)
+ *   A_BUY_DATE   : A전략 매수일
+ *   A_BUY_PRICE  : A전략 매수 가격 (ENTRY_ 키 기준 1005000)
+ */
+function fixLIGDipensTradingLog() {
+  const STOCK_NAME  = "079550";
+  const D_SELL_DATE = "2026-04-22";   // D포지션 청산일 (A전략 시작일)
+  const D_SELL_PRICE = 1005000;       // D포지션 청산가 (A전략 진입가로 대체)
+  const A_BUY_DATE  = "2026-04-22";
+  const A_BUY_PRICE = 1005000;
+  const A_LABEL     = "A. 200일선 상방 & 모멘텀 재가속";
+  const D_LABEL_NORM = "상승 흐름 강화";
+
+  const logSheet = Utils.getTradingLogSheet();
+  if (!logSheet) { console.log("[복구 실패] 시트를 찾을 수 없습니다."); return; }
+
+  const lastRow = logSheet.getLastRow();
+  if (lastRow < 3) { console.log("[복구] 데이터 없음"); return; }
+
+  const data = logSheet.getRange(3, 1, lastRow - 2, 6).getValues();
+  const normalizeLabel = (l) => String(l || "").replace(/^[A-F]\.\s*/, "").trim();
+
+  // ① D전략 미청산 행 찾아서 청산 처리
+  let dRowFixed = 0;
+  for (let i = 0; i < data.length; i++) {
+    const ticker = String(data[i][0]).trim();
+    if (ticker !== STOCK_NAME) continue;
+    if (data[i][3]) continue; // 이미 매도 있는 행 스킵
+    if (normalizeLabel(String(data[i][5] || "")) !== D_LABEL_NORM) continue;
+
+    logSheet.getRange(i + 3, 4).setValue(D_SELL_DATE);
+    Utils.setTradingLogPriceCell(logSheet.getRange(i + 3, 5), STOCK_NAME, D_SELL_PRICE);
+    dRowFixed++;
+    console.log(`[D청산 완료] LIG디펜스 행 ${i + 3}: 매도일 ${D_SELL_DATE}, 매도가 ₩${D_SELL_PRICE.toLocaleString()} 기입`);
+  }
+  if (dRowFixed === 0) console.log("[D청산] LIG디펜스 D전략 미청산 행 없음 (이미 처리됐거나 없음)");
+
+  // ② A전략 매수 행이 이미 있는지 확인
+  const latestData = logSheet.getRange(3, 1, logSheet.getLastRow() - 2, 6).getValues();
+  const A_LABEL_NORM = "모멘텀 재가속";
+  const aRowExists = latestData.some(r =>
+    String(r[0]).trim() === STOCK_NAME
+    && !r[3]
+    && normalizeLabel(String(r[5] || "")) === A_LABEL_NORM
+  );
+
+  if (aRowExists) {
+    console.log("[A매수] LIG디펜스 A전략 매수 행 이미 존재 — 추가 생략");
+  } else {
+    const newRow = Utils.getNextTradingLogRow(logSheet);
+    logSheet.getRange(newRow, 1, 1, 6).setValues([[STOCK_NAME, A_BUY_DATE, "", "", "", A_LABEL]]);
+    Utils.setTradingLogPriceCell(logSheet.getRange(newRow, 3), STOCK_NAME, A_BUY_PRICE);
+    SpreadsheetApp.flush();
+    console.log(`[A매수 추가] LIG디펜스 A전략 행 ${newRow}: 매수일 ${A_BUY_DATE}, 매수가 ₩${A_BUY_PRICE.toLocaleString()} 기입`);
+  }
+}
