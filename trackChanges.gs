@@ -150,8 +150,29 @@ function processMultiSlots(stockName, row, globalData, now, allProperties, kstDa
     const isOccupied = slot !== null;
 
     if (isOccupied) {
-      // 최신 미청산 레그의 EXIT가 종목 전체 청산을 결정하므로
-      // 활성 슬롯 자체는 독립 청산하지 않고 전역 매도 시점까지 유지한다.
+      const slotExit = Utils.evaluateSlotExit(row, globalData, now, slot, strategy, allProperties);
+      if (!slotExit) continue;
+
+      const dateStr     = typeof kstDate === "string" ? kstDate : Utilities.formatDate(kstDate, "Asia/Seoul", "yyyy-MM-dd");
+      const slotDateStr = slot.date ? Utilities.formatDate(slot.date, "Asia/Seoul", "yyyy.MM.dd") : "-";
+      const returnPct   = ((price - slot.price) / slot.price * 100).toFixed(2);
+      const entryNote   = `슬롯 진입가 ${Utils.fmtPrice(slot.price, stockName)} (${slotDateStr}) · 수익률 ${Number(returnPct) >= 0 ? "+" : ""}${returnPct}%`;
+
+      changes.push({
+        stock: displayName,
+        ticker: stockName,
+        from: `${stratShortLabel(strategy)} 보유중`,
+        to: `${stratShortLabel(strategy)} 부분매도`,
+        reason: slotExit.reason,
+        price: fmtP,
+        entryNote,
+        stopLoss: ""
+      });
+
+      Utils.recordSlotSellSignal(stockName, strategy, dateStr, price);
+      props.setProperty(`SLOT_SELL_${stockName}_${strategy}`, `${dateStr}|${price}`);
+      Utils.clearSlot(stockName, strategy, props);
+      console.log(`[슬롯 매도] ${displayName} ${strategy}그룹: ${slotExit.reason}`);
     } else {
       // ── 슬롯 신규 진입 조건 체크 ─────────────────────────────────────────
       // 주 전략 포지션이 없는 순수 관망 종목은 기존 handleOpinionChange 경로로 처리
@@ -192,7 +213,6 @@ function processMultiSlots(stockName, row, globalData, now, allProperties, kstDa
 
       Utils.saveSlot(stockName, strategy, price, dateStr, props);
       Utils.recordBuySignal(stockName, dateStr, price, label);
-      Utils.syncEntryRepresentativeFromTradingLog(stockName, props);
       console.log(`[슬롯 매수] ${displayName} ${strategy}그룹 병행 진입: ${reason}`);
     }
   }
@@ -334,10 +354,11 @@ const Utils = {
   },
 
   STRATEGY: {
-    VIX_MIN:         25,
+    VIX_MIN:         30,
     VIX_RELEASE:     23,
-    RSI_MAX:         40,
-    CCI_MIN:        -100,
+    RSI_MAX:         35,
+    CCI_MIN:        -150,
+    LR_TOUCH_RATIO:  1.05,
     // A그룹 (구 C | 200일선 상방 & 모멘텀 재가속): +20% 즉시
     TARGET_PCT_A:           0.20,
     CIRCUIT_PCT_A:          0.30,
@@ -347,26 +368,27 @@ const Utils = {
     TARGET_PCT_B:    0.20,
     CIRCUIT_PCT_B:   0.30,
     // C그룹 (NEW | 200일선 상방 & 스퀴즈 거래량 돌파): +18% 즉시
-    TARGET_PCT_C:              0.18,
+    TARGET_PCT_C:              0.20,
     CIRCUIT_PCT_C:             0.30,
-    BB_EXPAND_RATIO:           1.05,
+    C_SQUEEZE_RATIO:           0.45,
+    BB_EXPAND_RATIO:           1.00,
     SQUEEZE_BREAKOUT_VOL_RATIO: 1.5,
     SQUEEZE_BREAKOUT_PCTB_MIN:  55,
     // D그룹 (NEW | 200일선 상방 & 상승 흐름 강화): +18% 즉시
-    TARGET_PCT_D:    0.18,
+    TARGET_PCT_D:    0.20,
     CIRCUIT_PCT_D:   0.30,
-    ADX_MIN:         20,
+    ADX_MIN:         30,
     ADX_PCTB_MIN:    30,
-    ADX_PCTB_MAX:    75,
+    ADX_PCTB_MAX:    80,
     // E그룹 (구 A | 200일선 상방 & 스퀴즈 저점): +8% MACD 게이트
-    TARGET_PCT_E:    0.08,
+    TARGET_PCT_E:    0.20,
     CIRCUIT_PCT_E:   0.30,
     SQUEEZE_RATIO:   0.5,
     SQUEEZE_PCT_B_MAX: 50,
     // F그룹 (구 B | 200일선 상방 & BB 극단 저점): +8% MACD 게이트
-    TARGET_PCT_F:    0.08,
+    TARGET_PCT_F:    0.20,
     CIRCUIT_PCT_F:   0.30,
-    BB_PCT_B_LOW_MAX: 5,
+    BB_PCT_B_LOW_MAX: 3,
     // 공통
     HALF_EXIT_DAYS:    60,
     MAX_HOLD_DAYS:     120,
@@ -779,12 +801,12 @@ const Utils = {
     const bCond2 = vixToday >= vixThreshold;
     const lrSlope = (typeof getLRSlope === "function") ? getLRSlope(stockName) : 0;
     const bCond4 = lrSlope > 0;
-    const bCond5 = lrTrendline !== null && lrTrendline > 0 && candleLow !== null && candleLow <= lrTrendline * 1.03;
+    const bCond5 = lrTrendline !== null && lrTrendline > 0 && candleLow !== null && candleLow <= lrTrendline * S.LR_TOUCH_RATIO;
     const entryGroupB = bCond1 && bCond2 && bCond3 && bCond4 && bCond5;
 
     // ── C그룹: MA200 위 + 전일 스퀴즈 + 당일 BB확장 + 거래량 폭발 ────────────
     const cCond1 = currentPrice !== null && ma200 !== null && currentPrice > ma200;
-    const cCond2 = bbPairOk && bbWidthD1 !== null && (bbWidthD1 / bbWidthAvg60) < S.SQUEEZE_RATIO;
+    const cCond2 = bbPairOk && bbWidthD1 !== null && (bbWidthD1 / bbWidthAvg60) < S.C_SQUEEZE_RATIO;
     const cCond3 = bbPairOk && bbWidthD1 !== null && bbWidth > bbWidthD1 * S.BB_EXPAND_RATIO;
     const cCond4 = volRatio !== null && volRatio >= S.SQUEEZE_BREAKOUT_VOL_RATIO;
     const cCond5 = pctB !== null && pctB > S.SQUEEZE_BREAKOUT_PCTB_MIN;
@@ -1013,10 +1035,10 @@ const Utils = {
     const lrSlope  = (typeof getLRSlope === "function") ? getLRSlope(stockName) : 0;
     const groupB   = !groupA && bCond1 && (vixToday >= S.VIX_MIN)
                   && (rsiOk || cciOk) && lrSlope > 0
-                  && lrTrendline !== null && lrTrendline > 0 && candleLow !== null && candleLow <= lrTrendline * 1.03;
+                  && lrTrendline !== null && lrTrendline > 0 && candleLow !== null && candleLow <= lrTrendline * S.LR_TOUCH_RATIO;
 
     const cCond1   = currentPrice !== null && ma200 !== null && currentPrice > ma200;
-    const cCond2   = bbPairOk && bbWidthD1 !== null && (bbWidthD1 / bbWidthAvg60) < S.SQUEEZE_RATIO;
+    const cCond2   = bbPairOk && bbWidthD1 !== null && (bbWidthD1 / bbWidthAvg60) < S.C_SQUEEZE_RATIO;
     const cCond3   = bbPairOk && bbWidthD1 !== null && bbWidth > bbWidthD1 * S.BB_EXPAND_RATIO;
     const cCond4   = volRatio !== null && volRatio >= S.SQUEEZE_BREAKOUT_VOL_RATIO;
     const cCond5   = pctB !== null && pctB > S.SQUEEZE_BREAKOUT_PCTB_MIN;
@@ -1119,7 +1141,7 @@ const Utils = {
             : (!hasRsi && !hasCci) ? "RSI/CCI 일시 결측 (과매도 해소로 단정하지 않음)"
             : cond3Released ? `과매도 해소 (RSI ${Utils.fmtNumOrDash(rsi, 2)} / CCI ${Utils.fmtNumOrDash(cci, 2)})`
             : lrSlope <= 0 ? `추세선 기울기 하락 전환 (기울기 ≤ 0)`
-            : `저가 추세선 이탈 (저가 ${candleLow !== null ? fmtP(candleLow) : "-"} > 추세선 ${lrTrendline !== null ? fmtP(lrTrendline) : "-"} × 1.03)`;
+            : `저가 추세선 이탈 (저가 ${candleLow !== null ? fmtP(candleLow) : "-"} > 추세선 ${lrTrendline !== null ? fmtP(lrTrendline) : "-"} × ${S.LR_TOUCH_RATIO.toFixed(2)})`;
         } else if (stratType === "C") {
           releaseDetail = currentPrice <= ma200
             ? `200일선 하방 이탈 (현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)})`
@@ -1513,11 +1535,11 @@ const Utils = {
       return currentPrice < ma200
         && vixToday >= S.VIX_MIN && cond3 && lrSlope > 0
         && lrTrendline !== null && lrTrendline > 0
-        && candleLow !== null && candleLow <= lrTrendline * 1.03;
+        && candleLow !== null && candleLow <= lrTrendline * S.LR_TOUCH_RATIO;
     }
     if (strategy === "C") {
       return currentPrice > ma200
-        && bbPairOk && bbWidthD1 !== null && (bbWidthD1 / bbWidthAvg60) < S.SQUEEZE_RATIO
+        && bbPairOk && bbWidthD1 !== null && (bbWidthD1 / bbWidthAvg60) < S.C_SQUEEZE_RATIO
         && bbWidth > bbWidthD1 * S.BB_EXPAND_RATIO
         && volRatio !== null && volRatio >= S.SQUEEZE_BREAKOUT_VOL_RATIO
         && pctB !== null && pctB > S.SQUEEZE_BREAKOUT_PCTB_MIN
