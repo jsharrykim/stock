@@ -35,7 +35,13 @@ function trackChanges() {
   });
 
   console.log(`[분석 완료] 변경: ${changes.length}건, 현재 매수 의견: ${buyOpinions.length}개(${buyOpinions.length > 0 ? buyOpinions.join(", ") : "없음"}), 현재 매도 의견: ${sellOpinions.length}개(${sellOpinions.length > 0 ? sellOpinions.join(", ") : "없음"})`);
-  if (changes.length > 0) Utils.sendEmailAlert(targetSheet.getRange("F1").getValue(), changes, buyOpinions, sellOpinions, kstDate, estString);
+  if (changes.length > 0) {
+    const emailSent = Utils.sendEmailAlert(targetSheet.getRange("F1").getValue(), changes, buyOpinions, sellOpinions, kstDate, estString);
+    if (!emailSent) {
+      console.log("[이메일 미발송] lastValues 저장 보류 — 다음 실행에서 동일 변경 재시도");
+      throw new Error("투자의견 변경 이메일 발송 실패");
+    }
+  }
 
   Utils.saveLastValues(currentData, updatedOpinions, currentGlobalData);
   console.log(`[완료] ${((Date.now() - startTime) / 1000).toFixed(1)}초`);
@@ -240,14 +246,22 @@ function handleOpinionChange(stockName, fromOpinion, toOpinion, row, currentGlob
   const price       = Number(row[C.currentPrice]) || 0;
   const fmtP        = Utils.fmtPrice(price, stockName);
   const displayName = Utils.getDisplayName(stockName, row);
+  const existingEntry = Utils.loadEntryInfoFrom(stockName, allProperties);
+  const isHoldingRestore = toOpinion === "매수" && fromOpinion === "관망" && existingEntry.price > 0;
   let entryNote     = null;
 
   if (toOpinion === "매수") {
     props.deleteProperty(`UPPER_EXIT_ARM_${stockName}`);
-    const soldFlag    = allProperties[`SOLD_FLAG_${stockName}`];
-    const cycleEntry  = allProperties[`CYCLE_ENTRY_${stockName}`];
-    const isNewTrade  = (!allProperties[`ENTRY_${stockName}`] && !soldFlag) || !!soldFlag || fromOpinion === "초기값" || !cycleEntry;
-    if (isNewTrade) {
+    const soldFlag       = allProperties[`SOLD_FLAG_${stockName}`];
+    const cycleEntry     = allProperties[`CYCLE_ENTRY_${stockName}`];
+    const sellInfo       = allProperties[`SELL_${stockName}`];
+    const hasCycleHistory = !!soldFlag || !!cycleEntry || !!sellInfo || allProperties[`REENTRY_COUNT_${stockName}`] !== undefined;
+    const isNewTrade     = fromOpinion === "초기값" || (!existingEntry.price && !hasCycleHistory);
+    if (isHoldingRestore) {
+      entryNote = "보유 중 매수 복원";
+      props.deleteProperty(`SOLD_FLAG_${stockName}`);
+      console.log(`[진입 구분] ${displayName}: ${entryNote}`);
+    } else if (isNewTrade) {
       entryNote = "신규 진입";
       props.deleteProperty(`SOLD_FLAG_${stockName}`);
       props.setProperty(`REENTRY_COUNT_${stockName}`, "0");
@@ -256,8 +270,10 @@ function handleOpinionChange(stockName, fromOpinion, toOpinion, row, currentGlob
     } else {
       const prevCount  = parseInt(allProperties[`REENTRY_COUNT_${stockName}`] || "0");
       const newCount   = prevCount + 1;
-      const cyclePrice = parseFloat(allProperties[`CYCLE_ENTRY_${stockName}`] || "0") || 0;
+      const cyclePrice = parseFloat(allProperties[`CYCLE_ENTRY_${stockName}`] || "0") || existingEntry.price || price;
+      if (!cycleEntry && cyclePrice > 0) props.setProperty(`CYCLE_ENTRY_${stockName}`, String(cyclePrice));
       props.setProperty(`REENTRY_COUNT_${stockName}`, String(newCount));
+      props.deleteProperty(`SOLD_FLAG_${stockName}`);
       entryNote = cyclePrice > 0 ? `재진입 ${newCount}회차 — 최초 진입가 ${Utils.fmtPrice(cyclePrice, stockName)}` : `재진입 ${newCount}회차`;
       console.log(`[진입 구분] ${displayName}: ${entryNote}`);
     }
@@ -279,7 +295,6 @@ function handleOpinionChange(stockName, fromOpinion, toOpinion, row, currentGlob
   changes.push({ stock: displayName, ticker: stockName, from: fromOpinion, to: toOpinion, reason, price: fmtP, entryNote, stopLoss: "" });
 
   if (toOpinion === "매수" && fromOpinion !== "매수") {
-    const existingEntry = Utils.loadEntryInfoFrom(stockName, allProperties);
     // 관망 상태도 포지션 보유 중 → 다른 전략 신호 충돌 감지 대상에 포함
     const hasConflictingPrimary = (fromOpinion === "매수" || fromOpinion === "관망")
       && existingEntry.price > 0
@@ -289,6 +304,8 @@ function handleOpinionChange(stockName, fromOpinion, toOpinion, row, currentGlob
 
     if (hasConflictingPrimary) {
       console.log(`[멀티슬롯 위임] ${displayName}: 기존 ${existingEntry.strategyType}그룹 PRIMARY 보유 중 (${fromOpinion} 상태) → ${evaluatedStrategyType}그룹 신호는 processMultiSlots에 위임 (ENTRY_ 덮어쓰기 방지)`);
+    } else if (isHoldingRestore) {
+      console.log(`[트레이딩로그 생략] ${displayName}: 기존 보유 포지션의 관망→매수 복원 — 신규/재진입 로깅 없음`);
     } else {
       // 전략 타입 결정 우선순위: evaluatedStrategyType → ENTRY_ 키 → 시트 BC열
       // "F" 기본값 제거: 타이밍 차이로 evaluatedStrategyType이 null이더라도 기존 보유 전략 사용
@@ -932,7 +949,9 @@ const Utils = {
         ) {
           return {
             opinion: "관망",
-            reason: `보유 유지 (${savedStrategy}그룹 복원 대기: 앵커 대비 -${(S.HOLD_RESTORE_DROP * 100).toFixed(0)}% 또는 관망 ${S.HOLD_RESTORE_MIN_TRADING_DAYS}거래일 경과 시 복원)`,
+            reason: typeof buildHoldRestorePendingReason === "function"
+              ? buildHoldRestorePendingReason(stockName, savedStrategy, currentPrice, now, allProperties)
+              : `보유 유지 (${savedStrategy}그룹 복원 대기: 전 진입가 대비 -${(S.HOLD_RESTORE_DROP * 100).toFixed(0)}% 또는 관망 ${S.HOLD_RESTORE_MIN_TRADING_DAYS}거래일 경과 시 복원)`,
             strategyType: savedStrategy
           };
         }
@@ -1756,7 +1775,8 @@ const Utils = {
         const isNew      = c.entryNote === "신규 진입";
         const isReent    = c.entryNote.indexOf("재진입") === 0;
         const isConcurr  = c.entryNote.indexOf("병행 진입") === 0;
-        const noteColor  = isNew ? "#2980b9" : isReent ? "#e67e22" : isConcurr ? "#27ae60" : "#7f8c8d";
+        const isRestore  = c.entryNote === "보유 중 매수 복원";
+        const noteColor  = isNew ? "#2980b9" : isReent ? "#e67e22" : isConcurr ? "#27ae60" : isRestore ? "#8e44ad" : "#7f8c8d";
         entryNoteHtml = `<br><span style="font-size:12px;color:${noteColor};">${c.entryNote}</span>`;
       }
       return (
@@ -1780,12 +1800,25 @@ const Utils = {
       <p style="color:#888;font-size:12px;">발송 시각 (한국): ${kstDate}<br>발송 시각 (미 동부): ${estString}</p>
     </div>`;
 
-    try {
-      if (recipientEmail && recipientEmail.length > 0) {
-        GmailApp.sendEmail(recipientEmail, `투자의견 변경 알림 (${stockSymbols})`, "", { htmlBody: emailBody });
-        console.log(`[이메일 발송] ${stockSymbols} → ${recipientEmail}`);
-      } else { console.log("[이메일 실패] F1 셀 이메일 주소 없음"); }
-    } catch (e) { console.log(`[이메일 FATAL] ${e}`); }
+    if (!(recipientEmail && recipientEmail.length > 0)) {
+      console.log("[이메일 실패] F1 셀 이메일 주소 없음");
+      return false;
+    }
+
+    const subject = `투자의견 변경 알림 (${stockSymbols})`;
+    const maxAttempts = 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        GmailApp.sendEmail(recipientEmail, subject, "", { htmlBody: emailBody });
+        console.log(`[이메일 발송] ${stockSymbols} → ${recipientEmail} (시도 ${attempt}/${maxAttempts})`);
+        return true;
+      } catch (e) {
+        console.log(`[이메일 실패] 시도 ${attempt}/${maxAttempts}: ${e}`);
+        if (attempt < maxAttempts) Utilities.sleep(1500 * attempt);
+      }
+    }
+    console.log("[이메일 FATAL] 재시도 후에도 발송 실패");
+    return false;
   }
 };
 

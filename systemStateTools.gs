@@ -3,6 +3,7 @@
  *
  * 실행 함수:
  * - inspectCurrentSystemHoldings()
+ * - inspectCurrentHoldingsOverview()
  * - previewTradingLogSyncFromCurrentSystem()
  * - applyTradingLogSyncFromCurrentSystem()
  */
@@ -65,6 +66,106 @@ function inspectCurrentSystemHoldings() {
   if (mismatches.length === 0) console.log("없음");
   mismatches.forEach(line => console.log(" - " + line));
   console.log("========== 실제 시스템 보유 점검 종료 ==========");
+}
+
+function inspectCurrentHoldingsOverview() {
+  const { targetSheet } = Utils.getSheets("기술분석");
+  if (!targetSheet) {
+    console.log("[점검 실패] 기술분석 시트를 찾지 못했습니다.");
+    return;
+  }
+
+  const logSheet = Utils.getTradingLogSheet();
+  const allProperties = PropertiesService.getScriptProperties().getProperties();
+  const rows = _sstLoadTechRows_(targetSheet);
+  const openEntries = logSheet ? Utils.getOpenTradingLogEntries(logSheet) : [];
+  const openByStock = _sstGroupOpenEntriesByStock_(openEntries);
+  const lines = [];
+  const mismatches = [];
+  let systemHoldingCount = 0;
+  let logHoldingCount = 0;
+  let sheetHoldingCount = 0;
+
+  rows.forEach(({ row }) => {
+    const stockName = String(row[Utils.COL_INDICES.stockName] || "").trim();
+    if (!stockName) return;
+
+    const displayName = Utils.getDisplayName(stockName, row);
+    const opinion = String(row[Utils.COL_INDICES.opinion] || "").trim();
+    const saved = Utils.loadEntryInfoFrom(stockName, allProperties);
+    const slots = _sstLoadSlotEntries_(stockName, allProperties);
+    const openForStock = openByStock[stockName] || [];
+
+    const rawSheetDate = row[Utils.COL_INDICES.entryDate];
+    const sheetEntryDate = rawSheetDate instanceof Date
+      ? rawSheetDate
+      : (rawSheetDate ? Utils.parseDateKST(rawSheetDate) : null);
+    const sheetEntryPrice = Utils.toNum(row[Utils.COL_INDICES.entryPrice]) || 0;
+    const sheetStrategyLabel = String(row[Utils.COL_INDICES.entryStrategy] || "").trim();
+
+    const hasSystemHolding = saved.price > 0 || slots.length > 0;
+    const hasLogHolding = openForStock.length > 0;
+    const hasSheetHolding = sheetEntryPrice > 0 || !!sheetEntryDate || !!sheetStrategyLabel;
+
+    if (hasSystemHolding) systemHoldingCount++;
+    if (hasLogHolding) logHoldingCount++;
+    if (hasSheetHolding) sheetHoldingCount++;
+
+    if (!hasSystemHolding && !hasLogHolding && !hasSheetHolding && opinion !== "매수") return;
+
+    const parts = [];
+
+    if (saved.price > 0) {
+      const entryDate = saved.date ? Utilities.formatDate(saved.date, "Asia/Seoul", "yyyy-MM-dd") : "-";
+      parts.push(`SYSTEM PRIMARY ${saved.strategyType} ${Utils.fmtPrice(saved.price, stockName)} ${entryDate}`);
+    }
+
+    slots.forEach(slot => {
+      const slotDate = slot.date ? Utilities.formatDate(slot.date, "Asia/Seoul", "yyyy-MM-dd") : "-";
+      parts.push(`SYSTEM SLOT ${slot.strategy} ${Utils.fmtPrice(slot.price, stockName)} ${slotDate}`);
+    });
+
+    if (hasLogHolding) {
+      const latestLog = openForStock
+        .slice()
+        .sort((a, b) => b.buyDate.getTime() - a.buyDate.getTime() || b.rowNumber - a.rowNumber)[0];
+      parts.push(`LOG ${openForStock.length}건 / 최신 ${latestLog.strategyType} ${Utils.fmtPrice(latestLog.buyPrice, stockName)} ${latestLog.buyDateString}`);
+    }
+
+    if (hasSheetHolding) {
+      const sheetDateString = sheetEntryDate ? Utilities.formatDate(sheetEntryDate, "Asia/Seoul", "yyyy-MM-dd") : "-";
+      parts.push(`SHEET ${sheetStrategyLabel || "-"} ${sheetEntryPrice > 0 ? Utils.fmtPrice(sheetEntryPrice, stockName) : "-"} ${sheetDateString}`);
+    }
+
+    lines.push(`${displayName} | 의견:${opinion || "-"} | ${parts.join(" | ")}`);
+
+    if (hasLogHolding && !hasSystemHolding) {
+      mismatches.push(`${displayName}: 트레이딩로그 미청산은 있는데 시스템 보유 상태가 없음`);
+    }
+    if (hasSystemHolding && !hasLogHolding) {
+      mismatches.push(`${displayName}: 시스템 보유 상태는 있는데 트레이딩로그 미청산이 없음`);
+    }
+    if (opinion === "매수" && !hasSystemHolding && !hasLogHolding) {
+      mismatches.push(`${displayName}: 시트 의견은 매수인데 시스템/트레이딩로그 기준 보유가 아님`);
+    }
+    if (hasSheetHolding && !hasSystemHolding && !hasLogHolding) {
+      mismatches.push(`${displayName}: 시트 진입 정보만 남아 있음`);
+    }
+    if (!hasSheetHolding && (hasSystemHolding || hasLogHolding) && opinion !== "매도") {
+      mismatches.push(`${displayName}: 시스템/로그 보유 흔적은 있는데 시트 진입 정보가 비어 있음`);
+    }
+  });
+
+  console.log("========== 현재 보유 현황 점검 시작 ==========");
+  console.log(`[요약] SYSTEM=${systemHoldingCount} / LOG=${logHoldingCount} / SHEET=${sheetHoldingCount}`);
+  console.log("[보유/흔적 종목]");
+  if (lines.length === 0) console.log("없음");
+  lines.forEach(line => console.log(" - " + line));
+
+  console.log("[불일치]");
+  if (mismatches.length === 0) console.log("없음");
+  mismatches.forEach(line => console.log(" - " + line));
+  console.log("========== 현재 보유 현황 점검 종료 ==========");
 }
 
 function previewTradingLogSyncFromCurrentSystem() {

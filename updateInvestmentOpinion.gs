@@ -53,12 +53,13 @@ const CONSTANTS = {
     SQUEEZE_BREAKOUT_VOL_RATIO: 1.5,  // 거래량/20일평균 ≥ 1.5
     SQUEEZE_BREAKOUT_PCTB_MIN:  55,   // 종가 %B > 55
     // ── D그룹 (NEW | 200일선 상방 & 상승 흐름 강화) ──────────────────────────
-    // MA200 위 + +DI>-DI + ADX>20 + ADX상승 + MACD>0 + %B 30-75 → +18% 즉시 매도
+    // MA200 위 + +DI>-DI + ADX>30 + ADX상승 + MACD>0 + %B 30-75 + IXIC≤13 → +20% 즉시 매도
     TARGET_PCT_D:    0.20,
     CIRCUIT_PCT_D:   0.30,
     ADX_MIN:         30,
     ADX_PCTB_MIN:    30,
-    ADX_PCTB_MAX:    80,
+    ADX_PCTB_MAX:    75,
+    D_NASDAQ_DIST_MAX: 13,
     // ── E그룹 (구 A | 200일선 상방 & 스퀴즈 저점) ────────────────────────────
     // MA200 위 + BB스퀴즈 + 저가%B≤50 → +8% MACD 둔화전환 대기 (최대 5일)
     TARGET_PCT_E:    0.20,
@@ -82,7 +83,7 @@ const CONSTANTS = {
     NASDAQ_DIST_RELEASE: -2.5,  // 히스테리시스: 데스존 벗어난 뒤 이 이상일 때 차단 해제
     // E/F그룹 MACD 게이트 최대 대기
     UPPER_EXIT_MAX_WAIT_DAYS: 5,
-    // 보유 중 관망→매수 복원 조건 (A~F 공통)
+    // 보유 중 관망→매수 복원 조건 (A~F 공통 | 전 진입가 기준)
     HOLD_RESTORE_DROP:               0.03,
     HOLD_RESTORE_MIN_TRADING_DAYS:   3
   }
@@ -100,22 +101,64 @@ function clearAHoldRestoreProps(stockName) {
   p.deleteProperty("A_HOLD_WATCH_"  + stockName);
 }
 
-/** 보유 중 관망→매수 복원 허용 여부 (A-F 공통) */
-function aHoldRestoreAllowed(stockName, strategyType, currentPrice, now, allProperties) {
+function getHoldRestoreState(stockName, currentPrice, now, allProperties) {
   const S     = CONSTANTS.STRATEGY;
   const props = PropertiesService.getScriptProperties();
-  const anchor = parseFloat(
-    allProperties[HOLD_ANCHOR_PREFIX + stockName] || props.getProperty(HOLD_ANCHOR_PREFIX + stockName) ||
-    allProperties["A_HOLD_ANCHOR_" + stockName]   || props.getProperty("A_HOLD_ANCHOR_" + stockName)  || "0"
-  ) || 0;
+  const entry = parseEntryInfo(
+    allProperties[`ENTRY_${stockName}`] || props.getProperty(`ENTRY_${stockName}`)
+  );
   const watchStr =
     allProperties[HOLD_WATCH_PREFIX + stockName] || props.getProperty(HOLD_WATCH_PREFIX + stockName) ||
     allProperties["A_HOLD_WATCH_" + stockName]   || props.getProperty("A_HOLD_WATCH_" + stockName);
-  if (!watchStr) return true;
-  const watchDate = parseDateKST(watchStr);
-  const ddOk   = anchor > 0 && currentPrice > 0 && currentPrice <= anchor * (1 - S.HOLD_RESTORE_DROP);
-  const daysOk = calcTradingDays(watchDate, now) >= S.HOLD_RESTORE_MIN_TRADING_DAYS;
-  return ddOk || daysOk;
+  const watchDate = watchStr ? parseDateKST(watchStr) : null;
+  const requiredPrice = entry.price > 0 ? entry.price * (1 - S.HOLD_RESTORE_DROP) : 0;
+  const ddOk   = entry.price > 0 && currentPrice > 0 && currentPrice <= requiredPrice;
+  const days   = watchDate ? calcTradingDays(watchDate, now) : 0;
+  const daysOk = watchDate ? days >= S.HOLD_RESTORE_MIN_TRADING_DAYS : false;
+  return {
+    entryPrice: entry.price,
+    requiredPrice,
+    watchStr,
+    watchDate,
+    days,
+    ddOk,
+    daysOk,
+    allowed: ddOk || daysOk,
+    missingEntry: !(entry.price > 0),
+    missingWatch: !watchDate
+  };
+}
+
+/** 보유 중 관망→매수 복원 허용 여부 (A-F 공통) */
+function aHoldRestoreAllowed(stockName, strategyType, currentPrice, now, allProperties) {
+  return getHoldRestoreState(stockName, currentPrice, now, allProperties).allowed;
+}
+
+function buildHoldRestorePendingReason(stockName, strategyType, currentPrice, now, allProperties) {
+  const S     = CONSTANTS.STRATEGY;
+  const state = getHoldRestoreState(stockName, currentPrice, now, allProperties);
+  const label = strategyType || "-";
+  if (state.missingEntry) {
+    return `보유 유지 (${label}그룹 복원 대기: 전 진입가 정보 없음)`;
+  }
+  if (state.missingWatch) {
+    return `보유 유지 (${label}그룹 복원 대기: 전 진입가 ${fmtPrice(state.entryPrice, stockName)} 대비 -${(S.HOLD_RESTORE_DROP * 100).toFixed(0)}% 또는 관망 ${S.HOLD_RESTORE_MIN_TRADING_DAYS}거래일 경과 시 복원)`; 
+  }
+  return `보유 유지 (${label}그룹 복원 대기: 전 진입가 ${fmtPrice(state.entryPrice, stockName)} 대비 -${(S.HOLD_RESTORE_DROP * 100).toFixed(0)}% 또는 관망 ${S.HOLD_RESTORE_MIN_TRADING_DAYS}거래일 경과 시 복원)`;
+}
+
+function ensureHoldRestoreWatchState(stockName, currentPrice, now, allProperties, props) {
+  const state = getHoldRestoreState(stockName, currentPrice, now, allProperties);
+  if (!state.missingWatch) return state;
+  const store = props || PropertiesService.getScriptProperties();
+  store.setProperty(
+    HOLD_WATCH_PREFIX + stockName,
+    Utilities.formatDate(now, "Asia/Seoul", "yyyy-MM-dd'T'HH:mm:ss") + "+09:00"
+  );
+  if (currentPrice > 0) {
+    store.setProperty(HOLD_ANCHOR_PREFIX + stockName, String(currentPrice));
+  }
+  return getHoldRestoreState(stockName, currentPrice, now, allProperties);
 }
 
 const NASDAQ_AB_LATCH_KEY = "NasdaqABFilterLatched";
@@ -385,8 +428,9 @@ function clearUpperExitArm(stockName) {
   PropertiesService.getScriptProperties().deleteProperty(UPPER_EXIT_ARM_PREFIX + stockName);
 }
 
-function saveEntryInfo(stockName, price, date, strategyType = "A") {
-  clearAHoldRestoreProps(stockName);
+function saveEntryInfo(stockName, price, date, strategyType = "A", options = {}) {
+  const preserveRestoreState = !!options.preserveRestoreState;
+  if (!preserveRestoreState) clearAHoldRestoreProps(stockName);
   clearUpperExitArm(stockName);
   const val = `${price}|${Utilities.formatDate(date, "Asia/Seoul", "yyyy-MM-dd'T'HH:mm:ss")}+09:00|${strategyType}`;
   PropertiesService.getScriptProperties().setProperty(`ENTRY_${stockName}`, val);
@@ -463,7 +507,7 @@ function clearExitReason(stockName) {
  * A: MA200 위 + MACD 골든크로스 + %B>80 + RSI>70          (강세장 전용, 나스닥 ≥ -3%)
  * B: MA200 아래 + VIX≥25 + 과매도 + 추세선 터치            (나스닥 필터 미적용)
  * C: MA200 위 + BB스퀴즈 돌파 + 거래량 폭발 + %B>55        (강세장 전용, 나스닥 ≥ -3%)
- * D: MA200 위 + ADX>20 + +DI>-DI + ADX상승 + MACD>0       (강세장 전용, 나스닥 ≥ -3%)
+ * D: MA200 위 + ADX>30 + +DI>-DI + ADX상승 + MACD>0 + %B 30~75 + IXIC ≤ 13% (강세장 전용, -3% ≤ 나스닥 ≤ 13%)
  * E: MA200 위 + BB스퀴즈 + 저가%B≤50                       (히스테리시스 + 찐바닥 허용)
  * F: MA200 위 + 저가%B≤5                                   (히스테리시스 + 찐바닥 허용)
  */
@@ -516,15 +560,16 @@ function evaluateBuyCondition(ind, vixD, ixicDist, ixicFilterActive, isHolding =
                    && cCond1 && cCond2 && cCond3 && cCond4 && cCond5 && cCond6
                    && nasdaqAllowsStrictMomentum;
 
-  // ── D그룹: MA200 위 + +DI>-DI + ADX>20 + ADX상승 + MACD>0 + %B 30-75 ───
+  // ── D그룹: MA200 위 + +DI>-DI + ADX>30 + ADX상승 + MACD>0 + %B 30-75 + IXIC≤13 ───
   const dCond1 = ind.currentPrice > ind.ma200;
   const dCond2 = ind.plusDI !== null && ind.minusDI !== null && ind.plusDI > ind.minusDI;
   const dCond3 = ind.adx !== null && ind.adx > S.ADX_MIN;
   const dCond4 = ind.adx !== null && ind.adxD1 !== null && ind.adx > ind.adxD1;
   const dCond5 = ind.macdHist !== null && ind.macdHist > 0;
   const dCond6 = ind.pctB !== null && ind.pctB >= S.ADX_PCTB_MIN && ind.pctB <= S.ADX_PCTB_MAX;
+  const dCond7 = Number.isFinite(ixicDist) && ixicDist <= S.D_NASDAQ_DIST_MAX;
   const entryGroupD = !entryGroupA && !entryGroupB && !entryGroupC
-                   && dCond1 && dCond2 && dCond3 && dCond4 && dCond5 && dCond6
+                   && dCond1 && dCond2 && dCond3 && dCond4 && dCond5 && dCond6 && dCond7
                    && nasdaqAllowsStrictMomentum;
 
   // ── E그룹: MA200 위 + BB스퀴즈 + 저가%B≤50 ──────────────────────────────
@@ -583,7 +628,7 @@ function evaluateBuyCondition(ind, vixD, ixicDist, ixicFilterActive, isHolding =
     // C그룹
     cCond1, cCond2, cCond3, cCond4, cCond5, cCond6, bbPairOk,
     // D그룹
-    dCond1, dCond2, dCond3, dCond4, dCond5, dCond6,
+    dCond1, dCond2, dCond3, dCond4, dCond5, dCond6, dCond7,
     // E그룹
     eCond1, eCond2, eCond3,
     // F그룹
@@ -671,6 +716,7 @@ function fmtNumOrDash(v, decimals) {
 function processStocks(stockData, marketData, targetSheet, allProperties, outerStartTime) {
   const processStartTime = outerStartTime || Date.now();
   const TIMEOUT_GUARD_MS = 320000;
+  const props = PropertiesService.getScriptProperties();
 
   const changedStocks    = [];
   const C                = CONSTANTS.COL_INDICES;
@@ -730,7 +776,7 @@ function processStocks(stockData, marketData, targetSheet, allProperties, outerS
     if (saved.price <= 0 && activeSlots.length > 0) {
       const promotedSlot = pickLatestSlot(activeSlots);
       if (promotedSlot) {
-        saveEntryInfo(ind.stockName, promotedSlot.price, promotedSlot.date, promotedSlot.strategy);
+        saveEntryInfo(ind.stockName, promotedSlot.price, promotedSlot.date, promotedSlot.strategy, { preserveRestoreState: ind.opinion === "관망" });
         if (typeof Utils !== "undefined" && typeof Utils.clearSlot === "function") {
           Utils.clearSlot(ind.stockName, promotedSlot.strategy, props);
         }
@@ -753,7 +799,7 @@ function processStocks(stockData, marketData, targetSheet, allProperties, outerS
         || saved.strategyType !== latestOpenLeg.strategyType;
 
       if (entryMismatch) {
-        saveEntryInfo(ind.stockName, latestOpenLeg.buyPrice, latestOpenLeg.buyDate, latestOpenLeg.strategyType);
+        saveEntryInfo(ind.stockName, latestOpenLeg.buyPrice, latestOpenLeg.buyDate, latestOpenLeg.strategyType, { preserveRestoreState: ind.opinion === "관망" });
         saved.price = latestOpenLeg.buyPrice;
         saved.date  = latestOpenLeg.buyDate;
         saved.strategyType = latestOpenLeg.strategyType;
@@ -841,12 +887,13 @@ function processStocks(stockData, marketData, targetSheet, allProperties, outerS
       const sheetStratCode = parseStrategyCode(row[C.entryStrategy]);
       const restoredType   = sheetStratCode || buy.strategyType || saved.strategyType;
       saved.strategyType   = restoredType;
-      saveEntryInfo(ind.stockName, ind.entryPrice, ind.entryDate, restoredType);
+      saveEntryInfo(ind.stockName, ind.entryPrice, ind.entryDate, restoredType, { preserveRestoreState: ind.opinion === "관망" });
       entryStrategyWrites[i + 3] = strategyDisplayName(restoredType);  // 시트 BC열에도 기록
       console.log(` → [ENTRY_ 자동복구] ${ind.displayName}: Script Properties 키 유실 감지. ${sheetStratCode ? "시트 저장 전략" : "현재 조건 기준"} "${strategyDisplayName(restoredType)}"으로 복구 완료 (진입가: ${fmtPrice(ind.entryPrice, ind.stockName)})`);
     }
 
     const exit = isHolding ? evaluateExitCondition(ind, now, nasdaqPeakAlert, saved.strategyType, allProperties) : { shouldExit: false, reason: null };
+    const shouldDeferHoldingChange = isHolding && shouldDeferHoldingOpinionChange(saved.strategyType, ind, buy);
 
     logStockAnalysis(ind, vixD, ixicDist, marketData.event, buy, exit, now, isHolding, nasdaqPeakAlert, saved.strategyType, isMarketOpen, isKR, sellInfo);
 
@@ -894,20 +941,23 @@ function processStocks(stockData, marketData, targetSheet, allProperties, outerS
         } else if (ind.opinion === "매수") {
           if (buy.triggered) {
             console.log(` → [이벤트 중 보유 유지] ${ind.displayName}: 기존 보유 포지션 유지, 신규 진입만 차단`);
+          } else if (shouldDeferHoldingChange) {
+            console.log(` → [판단 유예] ${ind.displayName}: 보유 중 핵심 지표 결측 — 이벤트 기간에도 기존 의견 유지`);
           } else {
             newOpinion = "관망";
             console.log(` → [매수 조건 이탈 → 관망] ${ind.displayName}: 이벤트 기간에도 보유 해제 조건은 정상 반영`);
-            PropertiesService.getScriptProperties().setProperty(
+            props.setProperty(
               HOLD_ANCHOR_PREFIX + ind.stockName,
               String(ind.currentPrice)
             );
-            PropertiesService.getScriptProperties().setProperty(
+            props.setProperty(
               HOLD_WATCH_PREFIX + ind.stockName,
               Utilities.formatDate(now, "Asia/Seoul", "yyyy-MM-dd'T'HH:mm:ss") + "+09:00"
             );
           }
         } else {
           if (buy.triggered) console.log(` → [보유 유지/관망] ${ind.displayName}: 이벤트 기간 중 복원 보류`);
+          else if (shouldDeferHoldingChange) console.log(` → [보유 유지/관망] ${ind.displayName}: 핵심 지표 결측으로 복원/해제 판단 유예`);
           else console.log(` → [보유 유지/관망] ${ind.displayName}: 이벤트 기간, 매도 조건 미충족으로 관망 유지`);
         }
       } else if (ind.opinion === "매도") {
@@ -929,29 +979,42 @@ function processStocks(stockData, marketData, targetSheet, allProperties, outerS
         }
       } else if (ind.opinion === "매수") {
         if (buy.triggered) console.log(` → [매수 유지] ${ind.displayName}: 매수 조건 충족 중`);
+        else if (shouldDeferHoldingChange) {
+          console.log(` → [판단 유예] ${ind.displayName}: 보유 중 핵심 지표 결측 — 기존 매수 유지`);
+        }
         else {
           newOpinion = "관망";
           console.log(` → [매수 조건 이탈 → 관망] ${ind.displayName}: ENTRY_ 키 유지, 매도 조건 계속 추적`);
-          PropertiesService.getScriptProperties().setProperty(
+          props.setProperty(
             HOLD_ANCHOR_PREFIX + ind.stockName,
             String(ind.currentPrice)
           );
-          PropertiesService.getScriptProperties().setProperty(
+          props.setProperty(
             HOLD_WATCH_PREFIX + ind.stockName,
             Utilities.formatDate(now, "Asia/Seoul", "yyyy-MM-dd'T'HH:mm:ss") + "+09:00"
           );
         }
       } else {
         if (buy.triggered && !isEventWatch) {
-          if (aHoldRestoreAllowed(ind.stockName, saved.strategyType, ind.currentPrice, now, allProperties)) {
+          const restoreState = getHoldRestoreState(ind.stockName, ind.currentPrice, now, allProperties);
+          if (restoreState.allowed) {
             newOpinion = "매수";
             clearAHoldRestoreProps(ind.stockName);
-            console.log(` → [보유 유지/관망→매수 복원] ${ind.displayName}: 매수 조건 재충족`);
+            const restoreBasis = restoreState.ddOk
+              ? `전 진입가 ${fmtPrice(restoreState.entryPrice, ind.stockName)} 대비 -${(S.HOLD_RESTORE_DROP * 100).toFixed(0)}% 눌림 충족`
+              : `관망 ${restoreState.days}거래일 경과`;
+            console.log(` → [보유 유지/관망→매수 복원] ${ind.displayName}: 매수 조건 재충족 (${restoreBasis})`);
           } else {
-            console.log(
-              ` → [${saved.strategyType} 복원 보류] ${ind.displayName}: 앵커 대비 -${(S.HOLD_RESTORE_DROP * 100).toFixed(0)}%·관망 ${S.HOLD_RESTORE_MIN_TRADING_DAYS}거래일(OR) 충족 시에만 매수 복원`
-            );
+            const repairedState = ensureHoldRestoreWatchState(ind.stockName, ind.currentPrice, now, allProperties, props);
+            const restoreWait = repairedState.missingEntry
+              ? "전 진입가 정보 없음"
+              : repairedState.missingWatch
+              ? "관망 시작 시각 복구 실패"
+              : `전 진입가 ${fmtPrice(repairedState.entryPrice, ind.stockName)} 대비 -${(S.HOLD_RESTORE_DROP * 100).toFixed(0)}% 또는 관망 ${S.HOLD_RESTORE_MIN_TRADING_DAYS}거래일`;
+            console.log(` → [${saved.strategyType} 복원 보류] ${ind.displayName}: ${restoreWait} 충족 시에만 매수 복원`);
           }
+        } else if (shouldDeferHoldingChange) {
+          console.log(` → [보유 유지/관망] ${ind.displayName}: 핵심 지표 결측으로 복원/해제 판단 유예`);
         } else if (buy.triggered) console.log(` → [보유 유지/관망] ${ind.displayName}: 매수 조건 재충족이나 이벤트 당일 — 의견 복원 보류`);
         else console.log(` → [보유 유지/관망] ${ind.displayName}: ${calcTradingDays(ind.entryDate, now)}거래일, 수익률 ${((ind.currentPrice - ind.entryPrice) / ind.entryPrice * 100).toFixed(2)}% — 매도 조건 미충족, 관망 유지`);
       }
@@ -1052,7 +1115,7 @@ function processStocks(stockData, marketData, targetSheet, allProperties, outerS
     if (isHolding) {
       const effOp = opinionWrites[i + 3] !== undefined ? opinionWrites[i + 3] : ind.opinion;
       if (effOp === "매수" && ind.currentPrice > 0) {
-        PropertiesService.getScriptProperties().setProperty(HOLD_ANCHOR_PREFIX + ind.stockName, String(ind.currentPrice));
+        props.setProperty(HOLD_ANCHOR_PREFIX + ind.stockName, String(ind.currentPrice));
       }
     }
   }
@@ -1124,6 +1187,7 @@ function _buildReleaseReason(stratType, ind, buy, vixD, ixicDist, S) {
     case "D":
       if (!buy.dCond1) return `200일선 하방 이탈 (현재가 ${fP(ind.currentPrice)} / MA200 ${fP(ind.ma200)})`;
       if (!buy.nasdaqAllowsStrictMomentum) return `나스닥 이격도 부족 (${ixicDist.toFixed(1)}% < ${S.NASDAQ_DIST_UPPER}%)`;
+      if (!buy.dCond7) return `나스닥 과열 구간 (${ixicDist.toFixed(1)}% > ${S.D_NASDAQ_DIST_MAX}%)`;
       if (ind.plusDI === null || ind.minusDI === null || ind.macdHist === null) return "DMI/MACD 일시 결측 (추세 약화로 단정하지 않음)";
       return `추세 흐름 약화 (+DI ${fn(ind.plusDI, 1)} / -DI ${fn(ind.minusDI, 1)} 또는 MACD hist ${fn(ind.macdHist, 4)})`;
     case "E": {
@@ -1150,6 +1214,25 @@ function _buildReleaseReason(stratType, ind, buy, vixD, ixicDist, S) {
       return `BB 하단 눌림 해소 (저가%B ${fn(ind.pctBLow, 2)} > ${S.BB_PCT_B_LOW_MAX})`;
     }
     default: return "매수 조건 이탈";
+  }
+}
+
+function shouldDeferHoldingOpinionChange(stratType, ind, buy) {
+  if (!stratType) return false;
+  switch (stratType) {
+    case "A":
+    case "C":
+      return ind.macdHist === null;
+    case "B":
+      return !buy.hasRsi && !buy.hasCci;
+    case "D":
+      return ind.plusDI === null || ind.minusDI === null || ind.macdHist === null;
+    case "E":
+      return !buy.bbPairOk || ind.pctBLow === null;
+    case "F":
+      return ind.pctBLow === null;
+    default:
+      return false;
   }
 }
 
@@ -1258,8 +1341,8 @@ function logStockAnalysis(ind, vixD, ixicDist, event, buy, exit, now, isHolding,
     `\n  ⑥ 종가%B(${fn(ind.pctB, 1)}) > ${S.SQUEEZE_BREAKOUT_PCTB_MIN}: ${buy.cCond5 ? "✅" : "❌"}` +
     `\n  ⑦ MACD hist(${fn(ind.macdHist, 4)}) > 0: ${buy.cCond6 ? "✅" : "❌"}` +
 
-    `\n[D그룹: 200일선 상방 & 상승 흐름 강화 (나스닥 ≥${S.NASDAQ_DIST_UPPER}%)]` +
-    `\n  ① 나스닥 필터(강세장전용): ${buy.nasdaqAllowsStrictMomentum ? "✅" : "❌"}` +
+    `\n[D그룹: 200일선 상방 & 상승 흐름 강화 (-3% ≤ 나스닥 ≤ ${S.D_NASDAQ_DIST_MAX}%)]` +
+    `\n  ① 나스닥 필터(강세장전용): ${buy.nasdaqAllowsStrictMomentum ? "✅" : "❌"} | 상단캡 ${S.D_NASDAQ_DIST_MAX}% 이하: ${buy.dCond7 ? "✅" : "❌"} (현재 ${ixicDist.toFixed(1)}%)` +
     `\n  ② 현재가(${fmtP(ind.currentPrice)}) > MA200(${fmtP(ind.ma200)}): ${buy.dCond1 ? "✅" : "❌"}` +
     `\n  ③ +DI(${fn(ind.plusDI, 1)}) > -DI(${fn(ind.minusDI, 1)})${ind.plusDI === null ? " [컬럼 미설정 → 비활성]" : ""}: ${buy.dCond2 ? "✅" : "❌"}` +
     `\n  ④ ADX(${fn(ind.adx, 1)}) > ${S.ADX_MIN}: ${buy.dCond3 ? "✅" : "❌"}` +
@@ -1278,7 +1361,7 @@ function logStockAnalysis(ind, vixD, ixicDist, event, buy, exit, now, isHolding,
     `\n  ② 현재가(${fmtP(ind.currentPrice)}) > MA200(${fmtP(ind.ma200)}): ${buy.fCond1 ? "✅" : "❌"}` +
     `\n  ③ 저가%B(${fn(ind.pctBLow, 2)}) ≤ ${S.BB_PCT_B_LOW_MAX}: ${buy.fCond2 ? "✅" : "❌"}` +
 
-    `\n  → 최종 매수 신호: ${buy.triggered ? `✅ 충족 [${(isHolding ? strategyType : buy.strategyType) || "?"}그룹]` : "❌ 미충족"}${isHolding && buy.entryTriggered !== buy.triggered ? " (신규진입 기준과는 별도 복원 기준 적용)" : ""}` +
+    `\n  → 최종 매수 신호: ${buy.triggered ? `✅ 충족 [${(isHolding ? strategyType : buy.strategyType) || "?"}그룹]` : "❌ 미충족"}${isHolding && ind.opinion === "관망" && buy.entryTriggered !== buy.triggered ? " (신규진입 기준과는 별도 복원 기준 적용)" : ""}` +
     (isHolding
       ? `\n[포지션]\n  상태: 보유 중 (시트의견: ${ind.opinion}, 진입 기준: ${stratLabel})` +
         `\n  진입가: ${fmtP(ind.entryPrice)} | 진입일: ${entryDateStr} | 보유: ${tradingDays}거래일` +
