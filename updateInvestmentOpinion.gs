@@ -285,15 +285,6 @@ function strategyDisplayName(type) {
   return map[type] || type;
 }
 
-/** 에코프로비엠(247540) ENTRY_ 키 1회성 수동 정정 — 실행 후 이 함수 삭제 */
-function fixEcoProEntry() {
-  PropertiesService.getScriptProperties().setProperty(
-    'ENTRY_247540',
-    '197800|2026-04-10T00:00:00+09:00|E'
-  );
-  console.log('[fixEcoProEntry] ENTRY_247540 → price:197800 / date:2026-04-10 / strategy:E 수정 완료');
-}
-
 /** 시트 BC열 값(전체 이름 또는 단일 문자) → A~F 코드 추출 */
 function parseStrategyCode(cellValue) {
   if (!cellValue) return null;
@@ -728,9 +719,6 @@ function processStocks(stockData, marketData, targetSheet, allProperties, outerS
   const entryPriceWrites    = {};
   const entryDateWrites     = {};
   const entryStrategyWrites = {};
-  const latestOpenLogMap    = (typeof Utils !== "undefined" && Utils.getLatestOpenTradingLogEntryMap)
-    ? Utils.getLatestOpenTradingLogEntryMap()
-    : {};
 
   if (nasdaqPeakAlert) console.log("[나스닥 고점 경고] NasdaqPeakSellState=TRUE — ENTRY_ 키 보유 종목 전체 강제 매도 + 신규/재진입 차단");
 
@@ -767,17 +755,8 @@ function processStocks(stockData, marketData, targetSheet, allProperties, outerS
     let saved      = parseEntryInfo(rawEntry);
     const sellInfo = parseSellInfo(allProperties[`SELL_${ind.stockName}`]);
     let activeSlots = getActiveSlotsFromProperties(ind.stockName, allProperties);
-    // 시트 의견이 "매수"이거나 ENTRY_가 있으면 트레이딩 로그의 미청산 행으로 동기화를 허용한다.
-    // "관망"이면서 ENTRY_도 없으면 의도적으로 리셋된 상태이므로 복구하지 않는다.
-    const allowLegSync = activeSlots.length === 0 && (!!rawEntry || ind.opinion === "매수");
-    const latestOpenLeg = allowLegSync ? (latestOpenLogMap[ind.stockName] || null) : null;
-    const entryStrategyLabel = latestOpenLeg
-      ? latestOpenLeg.strategyType
-      : ((rawEntry && saved.price > 0) ? saved.strategyType : "-");
-    console.log(`[ENTRY_키] ${ind.displayName} — price: ${saved.price}, date: ${saved.date ? Utilities.formatDate(saved.date, "Asia/Seoul", "yyyy-MM-dd") : "null"}, strategy: ${entryStrategyLabel}`);
+    console.log(`[ENTRY_키] ${ind.displayName} — price: ${saved.price}, date: ${saved.date ? Utilities.formatDate(saved.date, "Asia/Seoul", "yyyy-MM-dd") : "null"}, strategy: ${saved.price > 0 ? saved.strategyType : "-"}`);
 
-    // ENTRY_가 사라진 상태는 명시적인 리셋/청산 상태로 간주한다.
-    // 시트 잔존값이나 트레이딩로그 미청산 행만으로 다시 "보유 복원"하지 않는다.
     if (!rawEntry && activeSlots.length === 0) {
       clearAHoldRestoreProps(ind.stockName);
     }
@@ -800,46 +779,10 @@ function processStocks(stockData, marketData, targetSheet, allProperties, outerS
       }
     }
 
-    if (latestOpenLeg) {
-      const latestDateStr = Utilities.formatDate(latestOpenLeg.buyDate, "Asia/Seoul", "yyyy-MM-dd");
-      const savedDateStr  = saved.date ? Utilities.formatDate(saved.date, "Asia/Seoul", "yyyy-MM-dd") : "";
-      const entryMismatch = saved.price !== latestOpenLeg.buyPrice
-        || savedDateStr !== latestDateStr
-        || saved.strategyType !== latestOpenLeg.strategyType;
+    const isHolding = saved.price > 0;
+    const buy  = evaluateBuyCondition(ind, vixD, ixicDist, ixicFilterActive, isHolding, isHolding ? saved.strategyType : null, allProperties);
 
-      if (entryMismatch) {
-        saveEntryInfo(ind.stockName, latestOpenLeg.buyPrice, latestOpenLeg.buyDate, latestOpenLeg.strategyType, { preserveRestoreState: ind.opinion === "관망" });
-        saved.price = latestOpenLeg.buyPrice;
-        saved.date  = latestOpenLeg.buyDate;
-        saved.strategyType = latestOpenLeg.strategyType;
-        console.log(` → [트레이딩로그 기준 동기화] ${ind.displayName}: 최신 미청산 ${fmtPrice(latestOpenLeg.buyPrice, ind.stockName)} / ${latestDateStr} / ${strategyDisplayName(latestOpenLeg.strategyType)}`);
-      }
-
-      ind.entryPrice = latestOpenLeg.buyPrice;
-      ind.entryDate  = latestOpenLeg.buyDate;
-
-      const sheetPrice    = Number(row[C.entryPrice]) || 0;
-      const sheetDateRaw  = row[C.entryDate];
-      const sheetDateStr  = sheetDateRaw instanceof Date
-        ? Utilities.formatDate(sheetDateRaw, "Asia/Seoul", "yyyy-MM-dd")
-        : (typeof sheetDateRaw === "string" ? sheetDateRaw.trim() : "");
-      const sheetStratCode = parseStrategyCode(row[C.entryStrategy]);
-
-      if (sheetPrice !== latestOpenLeg.buyPrice) {
-        entryPriceWrites[i + 3] = latestOpenLeg.buyPrice;
-        console.log(` → [진입가 동기화] ${ind.displayName}: 시트 ${fmtPrice(sheetPrice, ind.stockName)} → 로그 ${fmtPrice(latestOpenLeg.buyPrice, ind.stockName)}`);
-      }
-      if (sheetDateStr !== latestDateStr) {
-        entryDateWrites[i + 3] = latestDateStr;
-        console.log(` → [진입일 동기화] ${ind.displayName}: 시트 "${sheetDateStr}" → 로그 "${latestDateStr}"`);
-      }
-      if (sheetStratCode !== latestOpenLeg.strategyType) {
-        entryStrategyWrites[i + 3] = strategyDisplayName(latestOpenLeg.strategyType);
-        console.log(` → [전략 동기화] ${ind.displayName}: 시트 "${sheetStratCode || "없음"}" → 로그 "${strategyDisplayName(latestOpenLeg.strategyType)}"`);
-      }
-    }
-
-    if (!latestOpenLeg && saved.price > 0) {
+    if (saved.price > 0) {
       // ENTRY_ 키가 source of truth — 시트와 불일치하면 ENTRY_ 키 값으로 덮어씀
       ind.entryPrice = saved.price;
       ind.entryDate  = saved.date;
@@ -864,36 +807,6 @@ function processStocks(stockData, marketData, targetSheet, allProperties, outerS
         entryStrategyWrites[i + 3] = strategyDisplayName(saved.strategyType);
         console.log(` → [전략 동기화] ${ind.displayName}: 시트 "${sheetStratCode || "없음"}" → ENTRY_ "${strategyDisplayName(saved.strategyType)}"`);
       }
-    }
-
-    // ENTRY_ 삭제는 명시적 리셋으로 간주한다.
-    // 시트 진입가/진입일 잔존값만으로는 자동 복구하지 않는다.
-    const entryKeyLost = false;
-    if (entryKeyLost) {
-      saved.price = ind.entryPrice;
-      saved.date  = ind.entryDate;
-      // ① 시트에 저장된 전략 먼저 확인
-      const sheetStratCode = parseStrategyCode(row[C.entryStrategy]);
-      saved.strategyType   = sheetStratCode
-        ? sheetStratCode
-        : (ind.ma200 > 0 && ind.currentPrice < ind.ma200) ? "B" : "D";  // 임시, buy 평가 후 교체
-      if (sheetStratCode) {
-        console.log(` → [ENTRY_ 유실 감지] ${ind.displayName}: 시트 전략 "${strategyDisplayName(sheetStratCode)}" 발견 — 이 전략으로 복구 예정`);
-      }
-    }
-
-    const isHolding = saved.price > 0;
-    const buy  = evaluateBuyCondition(ind, vixD, ixicDist, ixicFilterActive, isHolding, isHolding ? saved.strategyType : null, allProperties);
-
-    // ENTRY_ 키 자동복구: buy 평가 결과에서 현재 조건에 맞는 전략 타입을 사용
-    // 시트에 이미 전략이 있었으면 saved.strategyType이 그 값이므로 buy.strategyType보다 우선
-    if (entryKeyLost) {
-      const sheetStratCode = parseStrategyCode(row[C.entryStrategy]);
-      const restoredType   = sheetStratCode || buy.strategyType || saved.strategyType;
-      saved.strategyType   = restoredType;
-      saveEntryInfo(ind.stockName, ind.entryPrice, ind.entryDate, restoredType, { preserveRestoreState: ind.opinion === "관망" });
-      entryStrategyWrites[i + 3] = strategyDisplayName(restoredType);  // 시트 BC열에도 기록
-      console.log(` → [ENTRY_ 자동복구] ${ind.displayName}: Script Properties 키 유실 감지. ${sheetStratCode ? "시트 저장 전략" : "현재 조건 기준"} "${strategyDisplayName(restoredType)}"으로 복구 완료 (진입가: ${fmtPrice(ind.entryPrice, ind.stockName)})`);
     }
 
     const exit = isHolding ? evaluateExitCondition(ind, now, nasdaqPeakAlert, saved.strategyType, allProperties) : { shouldExit: false, reason: null };

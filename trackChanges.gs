@@ -48,36 +48,6 @@ function trackChanges() {
   console.log("========== 투자의견 추적 종료 ==========");
 }
 
-function normalizeTradingLogPriceFormats() {
-  console.log("========== 트레이딩로그 가격 서식 정리 시작 ==========");
-
-  const logSheet = Utils.getTradingLogSheet();
-  if (!logSheet) { console.log("[실패] 트레이딩로그 시트 없음"); return; }
-
-  const lastRow = logSheet.getLastRow();
-  if (lastRow < 3) {
-    console.log("[완료] 정리할 데이터 없음");
-    console.log("========== 트레이딩로그 가격 서식 정리 종료 ==========");
-    return;
-  }
-
-  const data = logSheet.getRange(3, 1, lastRow - 2, 5).getValues();
-  let buyUpdatedCount  = 0;
-  let sellUpdatedCount = 0;
-
-  data.forEach((row, index) => {
-    const stockName = String(row[0] || "").trim();
-    if (!stockName) return;
-
-    const sheetRow = index + 3;
-    if (Utils.normalizeTradingLogPriceCell(logSheet.getRange(sheetRow, 3), stockName, row[2])) buyUpdatedCount++;
-    if (Utils.normalizeTradingLogPriceCell(logSheet.getRange(sheetRow, 5), stockName, row[4])) sellUpdatedCount++;
-  });
-
-  console.log(`[완료] 매수 가격 ${buyUpdatedCount}건, 매도 가격 ${sellUpdatedCount}건 서식 정리`);
-  console.log("========== 트레이딩로그 가격 서식 정리 종료 ==========");
-}
-
 function processData(currentData, currentGlobalData, lastEvent, currentValidOpinions, timeDetails, allProperties, props) {
   const { kstDate, now } = timeDetails;
   const changes          = [];
@@ -203,11 +173,7 @@ function processMultiSlots(stockName, row, globalData, now, allProperties, kstDa
       const dateStr   = typeof kstDate === "string" ? kstDate : Utilities.formatDate(kstDate, "Asia/Seoul", "yyyy-MM-dd");
       const label     = strategyDisplayName(strategy);
 
-      // 병행 진입 메모 (최초 진입가 표시용)
-      const cyclePrice  = parseFloat(allProperties[`CYCLE_ENTRY_${stockName}`] || "0") || 0;
-      const entryNote   = cyclePrice > 0
-        ? `병행 진입 (${strategy}그룹) — 최초 사이클 진입가 ${Utils.fmtPrice(cyclePrice, stockName)}`
-        : `병행 진입 (${strategy}그룹)`;
+      const entryNote   = `병행 진입 (${strategy}그룹)`;
       const reason      = Utils.buildSlotBuyReason(strategy, row, globalData);
 
       changes.push({
@@ -253,32 +219,28 @@ function handleOpinionChange(stockName, fromOpinion, toOpinion, row, currentGlob
 
   if (toOpinion === "매수") {
     props.deleteProperty(`UPPER_EXIT_ARM_${stockName}`);
-    const soldFlag       = allProperties[`SOLD_FLAG_${stockName}`];
-    const sellInfo       = allProperties[`SELL_${stockName}`];
-    // SOLD_FLAG: 실제 매도 발생 / SELL_: 매도 정보 존재 / REENTRY_COUNT > 0: 이미 재진입 이력 있음
-    // CYCLE_ENTRY 단독이나 REENTRY_COUNT=0 은 신규 진입 시 세팅되는 값이므로 사이클 히스토리로 보지 않음
-    const reentryCount   = parseInt(allProperties[`REENTRY_COUNT_${stockName}`] || "-1");
-    const hasCycleHistory = !!soldFlag || !!sellInfo || reentryCount > 0;
-    const isNewTrade     = fromOpinion === "초기값" || (!existingEntry.price && !hasCycleHistory);
     if (isHoldingRestore) {
       entryNote = "보유 중 매수 복원";
-      props.deleteProperty(`SOLD_FLAG_${stockName}`);
       console.log(`[진입 구분] ${displayName}: ${entryNote}`);
-    } else if (isNewTrade) {
-      entryNote = "신규 진입";
-      props.deleteProperty(`SOLD_FLAG_${stockName}`);
-      props.setProperty(`REENTRY_COUNT_${stockName}`, "0");
-      props.setProperty(`CYCLE_ENTRY_${stockName}`, String(price));
-      console.log(`[진입 구분] ${displayName}: 신규 진입 (가격: ${fmtP})`);
     } else {
-      const prevCount  = parseInt(allProperties[`REENTRY_COUNT_${stockName}`] || "0");
-      const newCount   = prevCount + 1;
-      const cyclePrice = parseFloat(allProperties[`CYCLE_ENTRY_${stockName}`] || "0") || existingEntry.price || price;
-      if (!allProperties[`CYCLE_ENTRY_${stockName}`] && cyclePrice > 0) props.setProperty(`CYCLE_ENTRY_${stockName}`, String(cyclePrice));
-      props.setProperty(`REENTRY_COUNT_${stockName}`, String(newCount));
-      props.deleteProperty(`SOLD_FLAG_${stockName}`);
-      entryNote = cyclePrice > 0 ? `재진입 ${newCount}회차 — 최초 진입가 ${Utils.fmtPrice(cyclePrice, stockName)}` : `재진입 ${newCount}회차`;
-      console.log(`[진입 구분] ${displayName}: ${entryNote}`);
+      const sellInfo   = allProperties[`SELL_${stockName}`];
+      const isNewTrade = fromOpinion === "초기값" || !sellInfo;
+      if (isNewTrade) {
+        entryNote = "신규 진입";
+        props.setProperty(`REENTRY_COUNT_${stockName}`, "0");
+        props.setProperty(`CYCLE_ENTRY_${stockName}`, String(price));
+        console.log(`[진입 구분] ${displayName}: 신규 진입 (가격: ${fmtP})`);
+      } else {
+        const prevCount  = parseInt(allProperties[`REENTRY_COUNT_${stockName}`] || "0");
+        const newCount   = prevCount + 1;
+        const cyclePrice = parseFloat(allProperties[`CYCLE_ENTRY_${stockName}`] || "0") || price;
+        if (!allProperties[`CYCLE_ENTRY_${stockName}`] && cyclePrice > 0) props.setProperty(`CYCLE_ENTRY_${stockName}`, String(cyclePrice));
+        props.setProperty(`REENTRY_COUNT_${stockName}`, String(newCount));
+        entryNote = cyclePrice > 0
+          ? `재진입 ${newCount}회차 — 최초 진입가 ${Utils.fmtPrice(cyclePrice, stockName)}`
+          : `재진입 ${newCount}회차`;
+        console.log(`[진입 구분] ${displayName}: ${entryNote}`);
+      }
     }
   }
 
@@ -290,9 +252,7 @@ function handleOpinionChange(stockName, fromOpinion, toOpinion, row, currentGlob
       const returnPct    = ((price - saved.price) / saved.price * 100).toFixed(2);
       entryNote = `진입가 ${Utils.fmtPrice(saved.price, stockName)} (${entryDateStr}) · 수익률 ${Number(returnPct) >= 0 ? "+" : ""}${returnPct}%`;
     }
-    props.setProperty(`SOLD_FLAG_${stockName}`, "true");
     Utils.clearAllSlotStateForStock(stockName, price, kstDate, props, allProperties);
-    console.log(`[SOLD_FLAG 세팅] ${displayName}`);
   }
 
   changes.push({ stock: displayName, ticker: stockName, from: fromOpinion, to: toOpinion, reason, price: fmtP, entryNote, stopLoss: "" });
@@ -328,7 +288,6 @@ function handleOpinionChange(stockName, fromOpinion, toOpinion, row, currentGlob
         console.log(`[경고] ${displayName}: 매수 신호 기록 시 전략 타입 미결정 — 레이블 없이 기록`);
       }
       Utils.recordBuySignal(stockName, kstDate, price, resolvedBuyStrategy ? strategyDisplayName(resolvedBuyStrategy) : "");
-      Utils.syncEntryRepresentativeFromTradingLog(stockName, props);
     }
   }
   if (toOpinion === "매도" && fromOpinion !== "매도") {
@@ -658,23 +617,6 @@ const Utils = {
       lastValidOpinions: updatedValidOpinions         ?? {},
     };
     PropertiesService.getScriptProperties().setProperty("lastValues", JSON.stringify(toSave));
-  },
-
-  snapshotOpinionsForTracking() {
-    const { targetSheet } = Utils.getSheets("기술분석");
-    if (!targetSheet) { console.log("[스냅샷] 시트 접근 실패"); return; }
-    const allProperties     = PropertiesService.getScriptProperties().getProperties();
-    const currentGlobalData = Utils.getGlobalData(targetSheet, allProperties);
-    const currentData       = targetSheet.getRange(3, 1, targetSheet.getLastRow() - 2, targetSheet.getLastColumn()).getValues();
-    const C                 = Utils.COL_INDICES;
-    const currentOpinions   = {};
-    currentData.forEach(row => {
-      const name    = String(row[C.stockName]).trim();
-      const opinion = String(row[C.opinion]).trim();
-      if (name && Utils.isValidOpinion(opinion)) currentOpinions[name] = { opinion, reason: "스냅샷" };
-    });
-    Utils.saveLastValues(null, currentOpinions, currentGlobalData);
-    console.log(`[스냅샷] 업데이트 전 투자의견 저장 완료 (${Object.keys(currentOpinions).length}종목)`);
   },
 
   isInitialRun(lastValues, targetSheet, currentGlobalData) {
@@ -1352,75 +1294,6 @@ const Utils = {
     const text = String(label || "").trim();
     const match = text.match(/^([A-F])\s*\./i) || text.match(/^([A-F])$/i);
     return match ? match[1].toUpperCase() : null;
-  },
-
-  getOpenTradingLogEntries(logSheet) {
-    const targetSheet = logSheet || Utils.getTradingLogSheet();
-    if (!targetSheet) return [];
-    const lastRow = targetSheet.getLastRow();
-    if (lastRow < 3) return [];
-
-    const data = targetSheet.getRange(3, 1, lastRow - 2, 6).getValues();
-    const entries = [];
-    for (let i = 0; i < data.length; i++) {
-      const row = data[i];
-      const stockName = String(row[0] || "").trim();
-      const buyDateRaw = row[1];
-      const buyPrice = Utils.parseTradingLogPriceInput(row[2]);
-      const sellDateRaw = row[3];
-      const strategyLabel = String(row[5] || "").trim();
-      const strategyType = Utils.parseTradingLogStrategyCode(strategyLabel);
-      if (!stockName || !buyDateRaw || buyPrice === null || buyPrice <= 0 || sellDateRaw) continue;
-
-      const buyDate = buyDateRaw instanceof Date ? buyDateRaw : Utils.parseDateKST(buyDateRaw);
-      if (!buyDate || isNaN(buyDate.getTime()) || !strategyType) continue;
-
-      entries.push({
-        stockName,
-        buyDate,
-        buyDateString: Utilities.formatDate(buyDate, "Asia/Seoul", "yyyy-MM-dd"),
-        buyPrice,
-        strategyType,
-        strategyLabel: strategyLabel || strategyDisplayName(strategyType),
-        rowNumber: i + 3
-      });
-    }
-    return entries;
-  },
-
-  getLatestOpenTradingLogEntryMap(logEntries) {
-    const entries = logEntries || Utils.getOpenTradingLogEntries();
-    const latestByStock = {};
-    entries.forEach(entry => {
-      const current = latestByStock[entry.stockName];
-      if (!current) {
-        latestByStock[entry.stockName] = entry;
-        return;
-      }
-      if (entry.buyDate.getTime() > current.buyDate.getTime() || entry.rowNumber > current.rowNumber) {
-        latestByStock[entry.stockName] = entry;
-      }
-    });
-    return latestByStock;
-  },
-
-  getLatestOpenTradingLogEntry(stockName, logEntries) {
-    const latestByStock = Utils.getLatestOpenTradingLogEntryMap(logEntries);
-    return latestByStock[stockName] || null;
-  },
-
-  syncEntryRepresentativeFromTradingLog(stockName, props) {
-    const latestOpen = Utils.getLatestOpenTradingLogEntry(stockName);
-    if (!latestOpen) return null;
-    const properties = props || PropertiesService.getScriptProperties();
-    properties.deleteProperty(`HOLD_ANCHOR_${stockName}`);
-    properties.deleteProperty(`HOLD_WATCH_${stockName}`);
-    properties.deleteProperty(`A_HOLD_ANCHOR_${stockName}`);
-    properties.deleteProperty(`A_HOLD_WATCH_${stockName}`);
-    properties.deleteProperty(`UPPER_EXIT_ARM_${stockName}`);
-    const value = `${latestOpen.buyPrice}|${Utilities.formatDate(latestOpen.buyDate, "Asia/Seoul", "yyyy-MM-dd'T'HH:mm:ss")}+09:00|${latestOpen.strategyType}`;
-    properties.setProperty(`ENTRY_${stockName}`, value);
-    return latestOpen;
   },
 
   clearAllSlotStateForStock(stockName, sellPrice, sellDate, props, allProperties) {

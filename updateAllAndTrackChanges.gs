@@ -30,9 +30,11 @@ function updateAllAndTrackChanges() {
     Utilities.sleep(30000);
     console.log(`[대기 완료] 투자의견 업데이트 시작`);
 
-    console.log(`[시작] pre-update opinion snapshot`);
-    Utils.snapshotOpinionsForTracking();
-    console.log(`[완료] pre-update opinion snapshot (${elapsed()})`);
+    // updateInvestmentOpinion 실행 전 현재 시트 상태를 trackChanges 비교 기준으로 저장.
+    // batchPrefetchPrices / updateLRTrendlineAll 실행 도중 Properties가 초기화되는 경우에도
+    // lastValues 가 항상 올바른 "변경 전" 상태를 갖도록 보장한다.
+    snapshotOpinionsBeforeUpdate_();
+    console.log(`[스냅샷] 투자의견 비교 기준 저장 완료 (${elapsed()})`);
 
     console.log(`[시작] updateInvestmentOpinion`);
     updateInvestmentOpinion();
@@ -59,6 +61,40 @@ function updateAllAndTrackChanges() {
   } finally {
     lock.releaseLock();
   }
+}
+
+/**
+ * updateInvestmentOpinion 실행 직전에 시트의 현재 투자의견을 lastValues로 저장.
+ * trackChanges가 항상 "변경 전" 기준을 올바르게 갖도록 보장한다.
+ */
+function snapshotOpinionsBeforeUpdate_() {
+  const ss        = SpreadsheetApp.getActiveSpreadsheet();
+  const techSheet = ss.getSheetByName("기술분석");
+  if (!techSheet) { console.log("[스냅샷] 기술분석 시트 없음 — 스킵"); return; }
+
+  const lastRow = techSheet.getLastRow();
+  if (lastRow < 3) { console.log("[스냅샷] 데이터 없음 — 스킵"); return; }
+
+  const numRows  = lastRow - 2;
+  const names    = techSheet.getRange(3, 1, numRows, 1).getValues();  // A열: 종목명 (COL_INDICES.stockName = 0)
+  const opinions = techSheet.getRange(3, 4, numRows, 1).getValues();  // D열: 투자의견 (COL_INDICES.opinion = 3)
+
+  const VALID = new Set(["매수", "매도", "관망"]);
+  const lastValidOpinions = {};
+  names.forEach(([name], i) => {
+    const n  = String(name).trim();
+    const op = String(opinions[i][0]).trim();
+    if (!n || !VALID.has(op)) return;
+    lastValidOpinions[n] = { opinion: op, reason: "트리거 실행 전 기준값" };
+  });
+
+  PropertiesService.getScriptProperties().setProperty("lastValues", JSON.stringify({
+    initialized:       true,
+    vixToday:          0,
+    event:             "당분간 없음",
+    lastValidOpinions,
+  }));
+  console.log(`[스냅샷] ${Object.keys(lastValidOpinions).length}종목 기준값 저장 완료`);
 }
 
 function setPipelineState_(status, stage, error) {
