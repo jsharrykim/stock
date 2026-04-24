@@ -224,3 +224,125 @@ function checkBuyOpinionsMissingEntryKey() {
   console.log("[판정] " + (issues.length === 0 ? "정상" : ("이상 " + issues.length + "건")));
   console.log("========== 매수 의견 종목 ENTRY_ 점검 종료 ==========");
 }
+
+/**
+ * 현재 Script Properties 기준으로 유효한 ENTRY_(보유 중) 종목을 모두 출력합니다.
+ * 시트 의견과 무관하게 ENTRY_ 키가 존재하는 종목 전체를 보여줍니다.
+ */
+function previewCurrentHoldings() {
+  const props = PropertiesService.getScriptProperties().getProperties();
+
+  const entries = Object.keys(props)
+    .filter(function(k) { return k.indexOf("ENTRY_") === 0; })
+    .map(function(k) {
+      const ticker = k.replace("ENTRY_", "");
+      const raw    = String(props[k] || "").trim();
+      const parts  = raw.split("|");
+      const price  = parts[0] ? Number(parts[0]) : 0;
+      const date   = parts[1] || "";
+      const strat  = parts[2] || "";
+      const slots  = Object.keys(props)
+        .filter(function(sk) { return sk.indexOf("SLOT_" + ticker + "_") === 0; })
+        .map(function(sk) {
+          const sp = String(props[sk] || "").split("|");
+          return sk.replace("SLOT_" + ticker + "_", "") +
+            ": " + (sp[0] ? Utils.fmtPrice(Number(sp[0]), ticker) : "?") +
+            " / " + (sp[1] || "?");
+        });
+      return { ticker, price, date, strat, slots, raw };
+    })
+    .filter(function(e) { return e.price > 0; })
+    .sort(function(a, b) { return a.ticker.localeCompare(b.ticker); });
+
+  console.log("========== 현재 보유 종목 (ENTRY_ 기준) ==========");
+  if (entries.length === 0) {
+    console.log("보유 종목 없음");
+  } else {
+    entries.forEach(function(e) {
+      const slotStr = e.slots.length > 0 ? " | 슬롯: [" + e.slots.join("] [") + "]" : "";
+      console.log(
+        e.ticker +
+        " | 진입가: " + Utils.fmtPrice(e.price, e.ticker) +
+        " | 진입일: " + e.date +
+        " | 전략: " + e.strat +
+        slotStr
+      );
+    });
+  }
+  console.log("총 " + entries.length + "종목");
+  console.log("========== 보유 종목 조회 종료 ==========");
+}
+
+/**
+ * 시트 의견이 "매수"인데 ENTRY_ 키가 없는 종목을 트레이딩 로그의 미청산 행으로 복구합니다.
+ * updateInvestmentOpinion 실행 전에 수동으로 한 번 돌려서 ENTRY_를 맞춰둘 때 씁니다.
+ */
+function restoreMissingEntryFromTradingLog() {
+  const sheetInfo = Utils.getSheets("기술분석");
+  const targetSheet = sheetInfo && sheetInfo.targetSheet;
+  if (!targetSheet) { console.log("[중단] 기술분석 시트 접근 실패"); return; }
+
+  const logSheet = Utils.getTradingLogSheet();
+  if (!logSheet) { console.log("[중단] 트레이딩로그 시트 접근 실패"); return; }
+
+  const props = PropertiesService.getScriptProperties();
+  const allProperties = props.getProperties();
+  const C = Utils.COL_INDICES;
+
+  // 트레이딩 로그에서 미청산 행(매수일 있고 매도일 없음) 수집
+  const lastLogRow = logSheet.getLastRow();
+  const logRows = lastLogRow >= 3 ? logSheet.getRange(3, 1, lastLogRow - 2, 6).getValues() : [];
+  const openLegs = {};
+  logRows.forEach(function(row) {
+    const ticker = String(row[0] || "").trim();
+    const buyDateRaw = row[1];
+    const buyPrice = Number(String(row[2] || "").replace(/[^0-9.-]/g, "")) || 0;
+    const sellDateRaw = row[3];
+    const strategyRaw = String(row[5] || "").trim();
+    if (!ticker || !buyDateRaw || buyPrice <= 0) return;
+    if (sellDateRaw) return; // 이미 매도됨
+
+    const buyDate = buyDateRaw instanceof Date ? buyDateRaw : new Date(String(buyDateRaw).replace(/\./g, "-"));
+    const stratCode = strategyRaw.match(/^([A-F])\./);
+    const strategyType = stratCode ? stratCode[1] : (strategyRaw.charAt(0) || "");
+
+    // 동일 종목 여러 건이면 가장 최근 것만 사용
+    if (!openLegs[ticker] || buyDate > openLegs[ticker].buyDate) {
+      openLegs[ticker] = { buyDate: buyDate, buyPrice: buyPrice, strategyType: strategyType };
+    }
+  });
+
+  // 기술분석 시트에서 매수 의견인데 ENTRY_ 없는 종목 찾아 복구
+  const lastRow = targetSheet.getLastRow();
+  const width = Math.max(C.stockName, C.stockLabel, C.opinion) + 1;
+  const rows = lastRow >= 3 ? targetSheet.getRange(3, 1, lastRow - 2, width).getValues() : [];
+
+  console.log("========== 매수 의견 ENTRY_ 복구 시작 ==========");
+  let fixed = 0, skipped = 0;
+
+  rows.forEach(function(row) {
+    const ticker = String(row[C.stockName] || "").trim();
+    const displayName = String(row[C.stockLabel] || ticker).trim();
+    const opinion = String(row[C.opinion] || "").trim();
+    if (!ticker || opinion !== "매수") return;
+
+    const rawEntry = String(allProperties["ENTRY_" + ticker] || "").trim();
+    const entryPrice = Number(rawEntry.split("|")[0]) || 0;
+    if (entryPrice > 0) { skipped++; return; } // 이미 있음
+
+    const leg = openLegs[ticker];
+    if (!leg) {
+      console.log(" [건너뜀] " + displayName + ": 트레이딩 로그에 미청산 행 없음");
+      return;
+    }
+
+    const dateStr = Utilities.formatDate(leg.buyDate, "Asia/Seoul", "yyyy-MM-dd");
+    const val = leg.buyPrice + "|" + dateStr + "|" + leg.strategyType;
+    props.setProperty("ENTRY_" + ticker, val);
+    console.log(" [복구] " + displayName + ": ENTRY_=" + val);
+    fixed++;
+  });
+
+  console.log("[결과] 복구 " + fixed + "건 / 이미 있음 " + skipped + "건");
+  console.log("========== 매수 의견 ENTRY_ 복구 종료 ==========");
+}

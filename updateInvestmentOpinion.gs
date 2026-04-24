@@ -767,11 +767,20 @@ function processStocks(stockData, marketData, targetSheet, allProperties, outerS
     let saved      = parseEntryInfo(rawEntry);
     const sellInfo = parseSellInfo(allProperties[`SELL_${ind.stockName}`]);
     let activeSlots = getActiveSlotsFromProperties(ind.stockName, allProperties);
-    const latestOpenLeg = activeSlots.length === 0 ? (latestOpenLogMap[ind.stockName] || null) : null;
+    // 시트 의견이 "매수"이거나 ENTRY_가 있으면 트레이딩 로그의 미청산 행으로 동기화를 허용한다.
+    // "관망"이면서 ENTRY_도 없으면 의도적으로 리셋된 상태이므로 복구하지 않는다.
+    const allowLegSync = activeSlots.length === 0 && (!!rawEntry || ind.opinion === "매수");
+    const latestOpenLeg = allowLegSync ? (latestOpenLogMap[ind.stockName] || null) : null;
     const entryStrategyLabel = latestOpenLeg
       ? latestOpenLeg.strategyType
       : ((rawEntry && saved.price > 0) ? saved.strategyType : "-");
     console.log(`[ENTRY_키] ${ind.displayName} — price: ${saved.price}, date: ${saved.date ? Utilities.formatDate(saved.date, "Asia/Seoul", "yyyy-MM-dd") : "null"}, strategy: ${entryStrategyLabel}`);
+
+    // ENTRY_가 사라진 상태는 명시적인 리셋/청산 상태로 간주한다.
+    // 시트 잔존값이나 트레이딩로그 미청산 행만으로 다시 "보유 복원"하지 않는다.
+    if (!rawEntry && activeSlots.length === 0) {
+      clearAHoldRestoreProps(ind.stockName);
+    }
 
     if (saved.price <= 0 && activeSlots.length > 0) {
       const promotedSlot = pickLatestSlot(activeSlots);
@@ -857,14 +866,9 @@ function processStocks(stockData, marketData, targetSheet, allProperties, outerS
       }
     }
 
-    // ENTRY_ 키 유실 감지: 시트에 진입가/진입일이 있고 의견이 매수인데 키가 없는 경우
-    // ① 시트 BC열(entryStrategy)에 저장된 전략이 있으면 그것을 우선 사용 (가장 정확)
-    // ② 없으면 buy 평가 결과 → ③ 최후 수단으로 MA200 위/아래 구분
-    // 시트에 진입가/진입일이 있는데 ENTRY_ 키가 없는 경우 → 키 유실로 판단
-    // 매수/관망: 아직 포지션 보유 중일 가능성 → 복구 대상
-    // 매도: 청산 후 시트 정리가 안 된 레거시 데이터일 가능성 → 복구 제외
-    const entryKeyLost = !latestOpenLeg && saved.price <= 0 && ind.entryPrice > 0 && ind.entryDate
-                      && (ind.opinion === "매수" || ind.opinion === "관망");
+    // ENTRY_ 삭제는 명시적 리셋으로 간주한다.
+    // 시트 진입가/진입일 잔존값만으로는 자동 복구하지 않는다.
+    const entryKeyLost = false;
     if (entryKeyLost) {
       saved.price = ind.entryPrice;
       saved.date  = ind.entryDate;
