@@ -459,15 +459,12 @@ function parseSellInfo(val) {
 }
 
 function getActiveSlotsFromProperties(stockName, allProperties) {
-  if (typeof Utils === "undefined" || typeof Utils.loadSlot !== "function") return [];
-
-  return ["A", "B", "C", "D", "E", "F"]
-    .map(strategy => Utils.loadSlot(stockName, strategy, allProperties))
-    .filter(Boolean)
+  if (typeof Utils === "undefined" || typeof Utils.loadSlots !== "function") return [];
+  return Utils.loadSlots(stockName, allProperties)
     .sort((a, b) => {
       const aTime = a.date ? a.date.getTime() : 0;
       const bTime = b.date ? b.date.getTime() : 0;
-      return bTime - aTime || String(a.strategy).localeCompare(String(b.strategy));
+      return aTime - bTime; // oldest first → ENTRY_ 표시 기준
     });
 }
 
@@ -766,10 +763,10 @@ function processStocks(stockData, marketData, targetSheet, allProperties, outerS
       if (promotedSlot) {
         saveEntryInfo(ind.stockName, promotedSlot.price, promotedSlot.date, promotedSlot.strategy, { preserveRestoreState: ind.opinion === "관망" });
         if (typeof Utils !== "undefined" && typeof Utils.clearSlot === "function") {
-          Utils.clearSlot(ind.stockName, promotedSlot.strategy, props);
+          Utils.clearSlot(ind.stockName, promotedSlot.id, props);
         }
         saved = { price: promotedSlot.price, date: promotedSlot.date, strategyType: promotedSlot.strategy };
-        activeSlots = activeSlots.filter(slot => slot.strategy !== promotedSlot.strategy);
+        activeSlots = activeSlots.filter(slot => slot.id !== promotedSlot.id);
         ind.entryPrice = promotedSlot.price;
         ind.entryDate = promotedSlot.date;
         entryPriceWrites[i + 3] = promotedSlot.price;
@@ -828,9 +825,9 @@ function processStocks(stockData, marketData, targetSheet, allProperties, outerS
 
       saveEntryInfo(ind.stockName, promotedSlot.price, promotedSlot.date, promotedSlot.strategy);
       if (typeof Utils !== "undefined" && typeof Utils.clearSlot === "function") {
-        Utils.clearSlot(ind.stockName, promotedSlot.strategy, props);
+        Utils.clearSlot(ind.stockName, promotedSlot.id, props);
       }
-      activeSlots = activeSlots.filter(slot => slot.strategy !== promotedSlot.strategy);
+      activeSlots = activeSlots.filter(slot => slot.id !== promotedSlot.id);
 
       const promotedBuy = evaluateBuyCondition(ind, vixD, ixicDist, ixicFilterActive, true, promotedSlot.strategy, allProperties);
       saved = { price: promotedSlot.price, date: promotedSlot.date, strategyType: promotedSlot.strategy };

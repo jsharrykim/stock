@@ -86,31 +86,22 @@ function processData(currentData, currentGlobalData, lastEvent, currentValidOpin
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// 멀티 슬롯 평가: 보유 중에도 다른 전략 조건 독립 체크
-// 주 전략(ENTRY_${stockName})과 별개로 SLOT_${stockName}_${strategy} 키로 관리
+// 멀티 슬롯 평가: 보유 중 독립 슬롯 진입/청산 처리
+// SLOTS_${stockName} JSON 배열로 관리 — 전략 종류 무관, 각 슬롯 독립 청산
 // ──────────────────────────────────────────────────────────────────────────────
 function processMultiSlots(stockName, row, globalData, now, allProperties, kstDate, changes, props) {
-  const C           = Utils.COL_INDICES;
-  const S           = Utils.STRATEGY;
-  const displayName = Utils.getDisplayName(stockName, row);
+  const C              = Utils.COL_INDICES;
+  const S              = Utils.STRATEGY;
+  const displayName    = Utils.getDisplayName(stockName, row);
   const currentOpinion = String(row[C.opinion] || "").trim();
-  const price       = Number(row[C.currentPrice]) || 0;
-  const fmtP        = Utils.fmtPrice(price, stockName);
+  const price          = Number(row[C.currentPrice]) || 0;
+  const fmtP           = Utils.fmtPrice(price, stockName);
   if (!price) return;
   if (currentOpinion === "매도") return;
 
-  // 주 전략 식별 (중복 방지)
-  const primaryEntry    = Utils.loadEntryInfoFrom(stockName, allProperties);
-  const primaryStrategy = primaryEntry.price > 0 ? primaryEntry.strategyType : null;
+  const dateStr = typeof kstDate === "string" ? kstDate : Utilities.formatDate(kstDate, "Asia/Seoul", "yyyy-MM-dd");
 
-  const STRATEGIES = ["A", "B", "C", "D", "E", "F"];
-
-  for (const strategy of STRATEGIES) {
-    // 주 전략과 동일한 그룹은 기존 로직에서 이미 처리 → 스킵
-    if (strategy === primaryStrategy) continue;
-
-    // 이메일에 표시할 전략 레이블 (보유 중 / 신규 구분)
-    const stratShortLabel = s =>
+  const stratShortLabel = s =>
       s === "A" ? "A그룹 [모멘텀 재가속]"
     : s === "B" ? "B그룹 [공황 저점]"
     : s === "C" ? "C그룹 [스퀴즈 거래량 돌파]"
@@ -118,75 +109,108 @@ function processMultiSlots(stockName, row, globalData, now, allProperties, kstDa
     : s === "E" ? "E그룹 [스퀴즈 저점]"
     :             "F그룹 [BB 극단 저점]";
 
-    const primaryFromLabel = primaryStrategy
-      ? `${stratShortLabel(primaryStrategy)} 보유중`
-      : "보유중";
+  // ── 1. 기존 슬롯 청산 평가 ────────────────────────────────────────────────
+  const activeSlots = Utils.loadSlots(stockName, allProperties);
 
-    const slot       = Utils.loadSlot(stockName, strategy, allProperties);
-    const isOccupied = slot !== null;
+  for (const slot of activeSlots) {
+    const slotExit = Utils.evaluateSlotExit(row, globalData, now, slot, slot.strategy, allProperties);
+    if (!slotExit) continue;
 
-    if (isOccupied) {
-      const slotExit = Utils.evaluateSlotExit(row, globalData, now, slot, strategy, allProperties);
-      if (!slotExit) continue;
+    const slotDateStr = slot.date ? Utilities.formatDate(slot.date, "Asia/Seoul", "yyyy.MM.dd") : "-";
+    const returnPct   = ((price - slot.price) / slot.price * 100).toFixed(2);
+    const entryInfo   = `진입가 ${Utils.fmtPrice(slot.price, stockName)} (${slotDateStr}) · 수익률 ${Number(returnPct) >= 0 ? "+" : ""}${returnPct}%`;
 
-      const dateStr     = typeof kstDate === "string" ? kstDate : Utilities.formatDate(kstDate, "Asia/Seoul", "yyyy-MM-dd");
-      const slotDateStr = slot.date ? Utilities.formatDate(slot.date, "Asia/Seoul", "yyyy.MM.dd") : "-";
-      const returnPct   = ((price - slot.price) / slot.price * 100).toFixed(2);
-      const entryNote   = `슬롯 진입가 ${Utils.fmtPrice(slot.price, stockName)} (${slotDateStr}) · 수익률 ${Number(returnPct) >= 0 ? "+" : ""}${returnPct}%`;
+    Utils.clearSlot(stockName, slot.id, props);
+    props.setProperty(`SLOT_SELL_${stockName}_${slot.strategy}`, `${dateStr}|${price}`);
 
-      changes.push({
-        stock: displayName,
-        ticker: stockName,
-        from: `${stratShortLabel(strategy)} 보유중`,
-        to: `${stratShortLabel(strategy)} 부분매도`,
-        reason: slotExit.reason,
-        price: fmtP,
-        entryNote,
-        stopLoss: ""
-      });
+    const remaining = Utils.loadSlots(stockName, props.getProperties());
+    const remainingNote = remaining.length > 0
+      ? `\n▪ 잔여 보유: ${remaining.map(s => {
+          const sd = s.date ? Utilities.formatDate(s.date instanceof Date ? s.date : Utils.parseDateKST(s.date), "Asia/Seoul", "yyyy.MM.dd") : "-";
+          return `${stratShortLabel(s.strategy)} ${Utils.fmtPrice(s.price, stockName)} (${sd})`;
+        }).join(", ")}`
+      : "";
 
-      Utils.recordSlotSellSignal(stockName, strategy, dateStr, price);
-      props.setProperty(`SLOT_SELL_${stockName}_${strategy}`, `${dateStr}|${price}`);
-      Utils.clearSlot(stockName, strategy, props);
-      console.log(`[슬롯 매도] ${displayName} ${strategy}그룹: ${slotExit.reason}`);
-    } else {
-      // ── 슬롯 신규 진입 조건 체크 ─────────────────────────────────────────
-      // 주 전략 포지션이 없는 순수 관망 종목은 기존 handleOpinionChange 경로로 처리
-      // → 중복 신호 방지를 위해 primaryEntry가 있을 때만 병행 진입 허용
-      if (!primaryEntry || primaryEntry.price <= 0) continue;
+    changes.push({
+      stock: displayName, ticker: stockName,
+      from:  currentOpinion,
+      to:    "매도",
+      reason: `${stratShortLabel(slot.strategy)} ${slotExit.reason}`,
+      price: fmtP,
+      entryNote: entryInfo + remainingNote,
+      stopLoss: ""
+    });
 
-      const canEnter = Utils.evaluateSlotEntry(row, globalData, strategy, stockName);
-      if (!canEnter) continue;
+    Utils.recordSlotSellSignal(stockName, slot.strategy, dateStr, price);
+    console.log(`[슬롯 매도] ${displayName} ${slot.strategy}그룹: ${slotExit.reason}`);
+  }
 
-      // 매도 후 재진입 쿨다운은 슬롯에서도 적용 (슬롯별 SELL 기록 없으면 허용)
-      const slotSellKey = `SLOT_SELL_${stockName}_${strategy}`;
-      const slotSellVal = allProperties[slotSellKey];
-      if (slotSellVal) {
-        const sellTime     = Utils.parseDateKST(slotSellVal.split("|")[0]);
-        const sellPrice    = Number(slotSellVal.split("|")[1]) || 0;
-        const elapsedHours = sellTime ? (now - sellTime) / (1000 * 60 * 60) : S.SELL_HOLD_HOURS + 1;
-        const daysSinceSell = Utils.calcTradingDays(sellTime, now);
-        if (elapsedHours < S.SELL_HOLD_HOURS) { console.log(`[슬롯 진입 보류] ${displayName} ${strategy}그룹: 매도 후 ${elapsedHours.toFixed(1)}h 대기중`); continue; }
-        if (daysSinceSell <= S.REENTRY_DAYS && !(sellPrice > 0 && price <= sellPrice * (1 - S.REENTRY_DROP))) { console.log(`[슬롯 진입 보류] ${displayName} ${strategy}그룹: 재진입 필터`); continue; }
-      }
+  // ── 2. 신규 슬롯 진입 평가 ────────────────────────────────────────────────
+  // ENTRY_ 없는 순수 관망 → 첫 진입은 handleOpinionChange 경로로 처리
+  const primaryEntry = Utils.loadEntryInfoFrom(stockName, allProperties);
+  if (!primaryEntry || primaryEntry.price <= 0) return;
 
-      const dateStr   = typeof kstDate === "string" ? kstDate : Utilities.formatDate(kstDate, "Asia/Seoul", "yyyy-MM-dd");
-      const label     = strategyDisplayName(strategy);
+  const STRATEGIES = ["A", "B", "C", "D", "E", "F"];
 
-      const entryNote   = `병행 진입 (${strategy}그룹)`;
-      const reason      = Utils.buildSlotBuyReason(strategy, row, globalData);
-
-      changes.push({
-        stock: displayName, ticker: stockName,
-        from:  primaryFromLabel,
-        to:    `${stratShortLabel(strategy)} 추가매수`,
-        reason, price: fmtP, entryNote, stopLoss: ""
-      });
-
-      Utils.saveSlot(stockName, strategy, price, dateStr, props);
-      Utils.recordBuySignal(stockName, dateStr, price, label);
-      console.log(`[슬롯 매수] ${displayName} ${strategy}그룹 병행 진입: ${reason}`);
+  for (const strategy of STRATEGIES) {
+    // 현재 시점 Props 기준 — 해당 전략 슬롯 이미 있으면 skip
+    const liveProps  = props.getProperties();
+    const liveSlots  = Utils.loadSlots(stockName, liveProps);
+    if (liveSlots.some(s => s.strategy === strategy)) continue;
+    if (currentOpinion === "매수" && primaryEntry.strategyType && primaryEntry.strategyType === strategy) {
+      console.log(`[슬롯 진입 건너뜀] ${displayName} ${strategy}그룹: 현재 매수 유지 중인 ENTRY 전략과 동일`);
+      continue;
     }
+
+    const canEnter = Utils.evaluateSlotEntry(row, globalData, strategy, stockName);
+    if (!canEnter) continue;
+
+    const mergedProps = { ...allProperties, ...liveProps };
+    const restoreState = Utils.getHoldRestoreState(stockName, price, now, mergedProps);
+    if (!restoreState.allowed) {
+      console.log(`[슬롯 진입 보류] ${displayName} ${strategy}그룹: ${Utils.buildHoldRestorePendingReason(stockName, price, now, mergedProps, strategy)}`);
+      continue;
+    }
+
+    // 매도 후 재진입 쿨다운 체크
+    const slotSellVal = liveProps[`SLOT_SELL_${stockName}_${strategy}`] || allProperties[`SLOT_SELL_${stockName}_${strategy}`];
+    if (slotSellVal) {
+      const sellTime      = Utils.parseDateKST(slotSellVal.split("|")[0]);
+      const sellPrice     = Number(slotSellVal.split("|")[1]) || 0;
+      const elapsedHours  = sellTime ? (now - sellTime) / (1000 * 60 * 60) : S.SELL_HOLD_HOURS + 1;
+      const daysSinceSell = Utils.calcTradingDays(sellTime, now);
+      if (elapsedHours < S.SELL_HOLD_HOURS) {
+        console.log(`[슬롯 진입 보류] ${displayName} ${strategy}그룹: 매도 후 ${elapsedHours.toFixed(1)}h 대기중`);
+        continue;
+      }
+      if (daysSinceSell <= S.REENTRY_DAYS && !(sellPrice > 0 && price <= sellPrice * (1 - S.REENTRY_DROP))) {
+        console.log(`[슬롯 진입 보류] ${displayName} ${strategy}그룹: 재진입 필터`);
+        continue;
+      }
+    }
+
+    // 재진입 N회차 카운트
+    const prevCount  = parseInt(liveProps[`REENTRY_COUNT_${stockName}`] || allProperties[`REENTRY_COUNT_${stockName}`] || "0");
+    const newCount   = prevCount + 1;
+    const cyclePrice = parseFloat(liveProps[`CYCLE_ENTRY_${stockName}`] || allProperties[`CYCLE_ENTRY_${stockName}`] || "0") || primaryEntry.price;
+    props.setProperty(`REENTRY_COUNT_${stockName}`, String(newCount));
+
+    const label     = strategyDisplayName(strategy);
+    const reason    = Utils.buildSlotBuyReason(strategy, row, globalData);
+    const entryNote = cyclePrice > 0
+      ? `재진입 ${newCount}회차 — 최초 진입가 ${Utils.fmtPrice(cyclePrice, stockName)}`
+      : `재진입 ${newCount}회차`;
+
+    changes.push({
+      stock: displayName, ticker: stockName,
+      from:  currentOpinion,
+      to:    "매수",
+      reason, price: fmtP, entryNote, stopLoss: ""
+    });
+
+    Utils.saveSlot(stockName, strategy, price, dateStr, props);
+    Utils.recordBuySignal(stockName, dateStr, price, label);
+    console.log(`[슬롯 매수] ${displayName} ${strategy}그룹 재진입 ${newCount}회차: ${reason}`);
   }
 }
 
@@ -661,6 +685,42 @@ const Utils = {
       if (dow !== 0 && dow !== 6) count++;
     }
     return count;
+  },
+
+  getHoldRestoreState(stockName, currentPrice, now, allProperties) {
+    const S = Utils.STRATEGY;
+    const props = PropertiesService.getScriptProperties();
+    const merged = allProperties || {};
+    const entry = Utils.loadEntryInfoFrom(stockName, merged);
+    const watchStr =
+      merged[`HOLD_WATCH_${stockName}`] || props.getProperty(`HOLD_WATCH_${stockName}`) ||
+      merged[`A_HOLD_WATCH_${stockName}`] || props.getProperty(`A_HOLD_WATCH_${stockName}`);
+    const watchDate = watchStr ? Utils.parseDateKST(watchStr) : null;
+    const requiredPrice = entry.price > 0 ? entry.price * (1 - S.HOLD_RESTORE_DROP) : 0;
+    const ddOk = entry.price > 0 && currentPrice > 0 && currentPrice <= requiredPrice;
+    const days = watchDate ? Utils.calcTradingDays(watchDate, now) : 0;
+    const daysOk = watchDate ? days >= S.HOLD_RESTORE_MIN_TRADING_DAYS : false;
+    return {
+      entryPrice: entry.price,
+      requiredPrice,
+      watchDate,
+      days,
+      ddOk,
+      daysOk,
+      allowed: ddOk || daysOk,
+      missingEntry: !(entry.price > 0),
+      missingWatch: !watchDate
+    };
+  },
+
+  buildHoldRestorePendingReason(stockName, currentPrice, now, allProperties, strategy) {
+    const S = Utils.STRATEGY;
+    const state = Utils.getHoldRestoreState(stockName, currentPrice, now, allProperties);
+    const label = strategy || "-";
+    if (state.missingEntry) {
+      return `${label}그룹 복원 대기: 전 진입가 정보 없음`;
+    }
+    return `${label}그룹 복원 대기: 전 진입가 ${Utils.fmtPrice(state.entryPrice, stockName)} 대비 -${(S.HOLD_RESTORE_DROP * 100).toFixed(0)}% 또는 관망 ${S.HOLD_RESTORE_MIN_TRADING_DAYS}거래일 경과 시 허용`;
   },
 
   loadEntryInfoFrom(stockName, allProperties) {
@@ -1298,26 +1358,32 @@ const Utils = {
 
   clearAllSlotStateForStock(stockName, sellPrice, sellDate, props, allProperties) {
     const properties = props || PropertiesService.getScriptProperties();
-    const snapshot = allProperties || properties.getProperties();
-    const prefixes = [
-      `SLOT_${stockName}_`,
-      `SLOT_UPPER_EXIT_ARM_${stockName}_`
-    ];
-    const slotKeys = Object.keys(snapshot).filter(key => key.indexOf(`SLOT_${stockName}_`) === 0 && key.indexOf(`SLOT_SELL_${stockName}_`) !== 0 && key.indexOf(`SLOT_UPPER_EXIT_ARM_${stockName}_`) !== 0);
-    slotKeys.forEach(key => {
-      const strategy = key.substring((`SLOT_${stockName}_`).length);
-      properties.deleteProperty(key);
-      properties.deleteProperty(`SLOT_UPPER_EXIT_ARM_${stockName}_${strategy}`);
-      if (sellDate) {
-        const dateStr = sellDate instanceof Date
-          ? Utilities.formatDate(sellDate, "Asia/Seoul", "yyyy-MM-dd")
-          : String(sellDate);
-        properties.setProperty(`SLOT_SELL_${stockName}_${strategy}`, `${dateStr}|${sellPrice}`);
-      }
-    });
+    const snapshot   = allProperties || properties.getProperties();
+
+    // SLOT_UPPER_EXIT_ARM_ 키 전부 제거
     Object.keys(snapshot)
-      .filter(key => prefixes.some(prefix => key.indexOf(prefix) === 0) && slotKeys.indexOf(key) === -1)
-      .forEach(key => properties.deleteProperty(key));
+      .filter(k => k.startsWith(`SLOT_UPPER_EXIT_ARM_${stockName}_`))
+      .forEach(k => properties.deleteProperty(k));
+
+    // 각 슬롯 전략에 대해 SLOT_SELL_ 쿨다운 기록
+    if (sellDate) {
+      const dateStr = sellDate instanceof Date
+        ? Utilities.formatDate(sellDate, "Asia/Seoul", "yyyy-MM-dd")
+        : String(sellDate);
+      Utils.loadSlots(stockName, snapshot).forEach(slot => {
+        properties.setProperty(`SLOT_SELL_${stockName}_${slot.strategy}`, `${dateStr}|${sellPrice}`);
+      });
+    }
+
+    // SLOTS_ 배열 키 제거
+    properties.deleteProperty(`SLOTS_${stockName}`);
+
+    // 레거시 SLOT_{stockName}_* 키 정리 (구 형식 잔재)
+    Object.keys(snapshot)
+      .filter(k => k.startsWith(`SLOT_${stockName}_`)
+               && !k.startsWith(`SLOT_SELL_${stockName}_`)
+               && !k.startsWith(`SLOT_UPPER_EXIT_ARM_${stockName}_`))
+      .forEach(k => properties.deleteProperty(k));
   },
 
   recordAllOpenSellSignals(stockName, sellDate, sellPrice) {
@@ -1343,28 +1409,48 @@ const Utils = {
   },
 
   // ── 멀티 슬롯 관리 ─────────────────────────────────────────────────────────
-  // SLOT_${stockName}_${strategy}: "price|dateStr"
-  // SLOT_SELL_${stockName}_${strategy}: "dateStr|sellPrice"
+  // SLOTS_${stockName}: JSON 배열 — [{ id, strategy, price, date }, ...]
+  // SLOT_SELL_${stockName}_${strategy}: "dateStr|sellPrice" (재진입 쿨다운용)
 
-  loadSlot(stockName, strategy, allProperties) {
-    const key = `SLOT_${stockName}_${strategy}`;
-    const val = allProperties[key];
-    if (!val) return null;
-    const [priceStr, dateStr] = val.split("|");
-    const price = Number(priceStr) || 0;
-    if (!price) return null;
-    return { price, date: Utils.parseDateKST(dateStr), strategy };
+  // 전체 슬롯 배열 로드
+  loadSlots(stockName, allProperties) {
+    const raw = (allProperties && allProperties[`SLOTS_${stockName}`])
+      || PropertiesService.getScriptProperties().getProperty(`SLOTS_${stockName}`);
+    if (!raw) return [];
+    try {
+      return JSON.parse(raw).map(s => ({ ...s, date: s.date ? Utils.parseDateKST(s.date) : null }));
+    } catch(e) {
+      console.log(`[SLOTS_ 파싱 오류] ${stockName}: ${e}`);
+      return [];
+    }
   },
 
+  // 특정 전략 첫 슬롯 반환 (하위 호환)
+  loadSlot(stockName, strategy, allProperties) {
+    return Utils.loadSlots(stockName, allProperties).find(s => s.strategy === strategy) || null;
+  },
+
+  // 슬롯 추가 — 배열에 append (덮어쓰기 없음)
   saveSlot(stockName, strategy, price, dateStr, props) {
     Utils.clearSlotUpperExitArm(stockName, strategy, props);
-    props.setProperty(`SLOT_${stockName}_${strategy}`, `${price}|${dateStr}`);
+    const properties = props || PropertiesService.getScriptProperties();
+    const existing = JSON.parse(properties.getProperty(`SLOTS_${stockName}`) || '[]');
+    existing.push({ id: `${strategy}_${Date.now()}`, strategy, price, date: dateStr });
+    properties.setProperty(`SLOTS_${stockName}`, JSON.stringify(existing));
   },
 
-  clearSlot(stockName, strategy, props) {
-    props.deleteProperty(`SLOT_${stockName}_${strategy}`);
-    Utils.clearSlotUpperExitArm(stockName, strategy, props);
-    // 매도 이력 기록 (재진입 쿨다운용) — 별도 저장은 processMultiSlots에서 처리
+  // 슬롯 제거 — ID 기준
+  clearSlot(stockName, slotId, props) {
+    const properties = props || PropertiesService.getScriptProperties();
+    const raw = properties.getProperty(`SLOTS_${stockName}`);
+    if (!raw) return;
+    const updated = JSON.parse(raw).filter(s => s.id !== slotId);
+    if (updated.length === 0) {
+      properties.deleteProperty(`SLOTS_${stockName}`);
+    } else {
+      properties.setProperty(`SLOTS_${stockName}`, JSON.stringify(updated));
+    }
+    Utils.clearSlotUpperExitArm(stockName, String(slotId).split('_')[0], props);
   },
 
   saveSlotUpperExitArm(stockName, strategy, date, props) {
@@ -1648,12 +1734,10 @@ const Utils = {
       const toColor     = isBuySignal ? "#27ae60" : isSellSignal ? "#c0392b" : "#7f8c8d";
       let entryNoteHtml = "";
       if (c.entryNote) {
-        const isNew      = c.entryNote === "신규 진입";
-        const isReent    = c.entryNote.indexOf("재진입") === 0;
-        const isConcurr  = c.entryNote.indexOf("병행 진입") === 0;
-        const isRestore  = c.entryNote === "보유 중 매수 복원";
-        const noteColor  = isNew ? "#2980b9" : isReent ? "#e67e22" : isConcurr ? "#27ae60" : isRestore ? "#8e44ad" : "#7f8c8d";
-        entryNoteHtml = `<br><span style="font-size:12px;color:${noteColor};">${c.entryNote}</span>`;
+        const isNew   = c.entryNote === "신규 진입";
+        const isReent = c.entryNote.startsWith("재진입");
+        const noteColor = isNew ? "#2980b9" : isReent ? "#e67e22" : "#7f8c8d";
+        entryNoteHtml = `<br><span style="font-size:12px;color:${noteColor};">${c.entryNote.replace(/\n/g, "<br>")}</span>`;
       }
       return (
         `<div style="margin-bottom:8px;padding:8px;background:#f9f9f9;border-left:3px solid ${borderColor};">` +
