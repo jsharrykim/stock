@@ -247,15 +247,18 @@ function handleOpinionChange(stockName, fromOpinion, toOpinion, row, currentGlob
   const fmtP        = Utils.fmtPrice(price, stockName);
   const displayName = Utils.getDisplayName(stockName, row);
   const existingEntry = Utils.loadEntryInfoFrom(stockName, allProperties);
-  const isHoldingRestore = toOpinion === "매수" && fromOpinion === "관망" && existingEntry.price > 0;
+  const hasRestoreWatch = !!(allProperties[`HOLD_WATCH_${stockName}`] || allProperties[`A_HOLD_WATCH_${stockName}`]);
+  const isHoldingRestore = toOpinion === "매수" && fromOpinion === "관망" && existingEntry.price > 0 && hasRestoreWatch;
   let entryNote     = null;
 
   if (toOpinion === "매수") {
     props.deleteProperty(`UPPER_EXIT_ARM_${stockName}`);
     const soldFlag       = allProperties[`SOLD_FLAG_${stockName}`];
-    const cycleEntry     = allProperties[`CYCLE_ENTRY_${stockName}`];
     const sellInfo       = allProperties[`SELL_${stockName}`];
-    const hasCycleHistory = !!soldFlag || !!cycleEntry || !!sellInfo || allProperties[`REENTRY_COUNT_${stockName}`] !== undefined;
+    // SOLD_FLAG: 실제 매도 발생 / SELL_: 매도 정보 존재 / REENTRY_COUNT > 0: 이미 재진입 이력 있음
+    // CYCLE_ENTRY 단독이나 REENTRY_COUNT=0 은 신규 진입 시 세팅되는 값이므로 사이클 히스토리로 보지 않음
+    const reentryCount   = parseInt(allProperties[`REENTRY_COUNT_${stockName}`] || "-1");
+    const hasCycleHistory = !!soldFlag || !!sellInfo || reentryCount > 0;
     const isNewTrade     = fromOpinion === "초기값" || (!existingEntry.price && !hasCycleHistory);
     if (isHoldingRestore) {
       entryNote = "보유 중 매수 복원";
@@ -271,7 +274,7 @@ function handleOpinionChange(stockName, fromOpinion, toOpinion, row, currentGlob
       const prevCount  = parseInt(allProperties[`REENTRY_COUNT_${stockName}`] || "0");
       const newCount   = prevCount + 1;
       const cyclePrice = parseFloat(allProperties[`CYCLE_ENTRY_${stockName}`] || "0") || existingEntry.price || price;
-      if (!cycleEntry && cyclePrice > 0) props.setProperty(`CYCLE_ENTRY_${stockName}`, String(cyclePrice));
+      if (!allProperties[`CYCLE_ENTRY_${stockName}`] && cyclePrice > 0) props.setProperty(`CYCLE_ENTRY_${stockName}`, String(cyclePrice));
       props.setProperty(`REENTRY_COUNT_${stockName}`, String(newCount));
       props.deleteProperty(`SOLD_FLAG_${stockName}`);
       entryNote = cyclePrice > 0 ? `재진입 ${newCount}회차 — 최초 진입가 ${Utils.fmtPrice(cyclePrice, stockName)}` : `재진입 ${newCount}회차`;
@@ -1822,11 +1825,3 @@ const Utils = {
   }
 };
 
-/**
- * 과거 TE/ONDS 한정 보정 함수명과의 호환용 래퍼입니다.
- * 이제는 전 종목 기준 동기화를 수행합니다.
- */
-function reconcileTeAndOndsTradingLogFromCurrentState() {
-  console.log("[안내] TE/ONDS 전용 보정은 폐기되었고, 전 종목 동기화를 실행합니다.");
-  applyTradingLogSyncFromCurrentSystem();
-}
