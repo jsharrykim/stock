@@ -377,12 +377,13 @@ const Utils = {
     BB_EXPAND_RATIO:           1.00,
     SQUEEZE_BREAKOUT_VOL_RATIO: 1.5,
     SQUEEZE_BREAKOUT_PCTB_MIN:  55,
-    // D그룹 (NEW | 200일선 상방 & 상승 흐름 강화): +18% 즉시
-    TARGET_PCT_D:    0.20,
-    CIRCUIT_PCT_D:   0.30,
+    // D그룹 (NEW | 200일선 상방 & 상승 흐름 강화): +12% / -25% / 30거래일
+    TARGET_PCT_D:    0.12,
+    CIRCUIT_PCT_D:   0.25,
     ADX_MIN:         30,
     ADX_PCTB_MIN:    30,
-    ADX_PCTB_MAX:    80,
+    ADX_PCTB_MAX:    75,
+    D_NASDAQ_DIST_MAX: 13,
     // E그룹 (구 A | 200일선 상방 & 스퀴즈 저점): +8% MACD 게이트
     TARGET_PCT_E:    0.20,
     CIRCUIT_PCT_E:   0.30,
@@ -395,6 +396,7 @@ const Utils = {
     // 공통
     HALF_EXIT_DAYS:    60,
     MAX_HOLD_DAYS:     120,
+    MAX_HOLD_DAYS_D:   30,
     SELL_HOLD_HOURS:   48,
     REENTRY_DAYS:      10,
     REENTRY_DROP:      0.03,
@@ -572,12 +574,16 @@ const Utils = {
     const kstHour      = Number(Utilities.formatDate(now, "Asia/Seoul", "HH"));
     const kstMinute    = Number(Utilities.formatDate(now, "Asia/Seoul", "mm"));
     const kstDayOfWeek = Number(Utilities.formatDate(now, "Asia/Seoul", "u")) % 7;
-    if (kstDayOfWeek === 0 || kstDayOfWeek === 6) return false;
     if (isKR) {
+      if (kstDayOfWeek === 0 || kstDayOfWeek === 6) return false;
       return (kstHour > 9 || (kstHour === 9 && kstMinute >= 0)) && (kstHour < 15 || (kstHour === 15 && kstMinute <= 30));
     } else {
-      const [openHour, closeHour] = Utils.isDST(now) ? [22, 5] : [23, 6];
-      return (kstHour === openHour && kstMinute >= 30) || (kstHour > openHour && kstHour < 24) || (kstHour >= 0 && kstHour < closeHour);
+      // 미국장은 뉴욕 현지 요일/시간으로 판정해야 KST 자정 이후(뉴욕 전일 장중)를 오판하지 않는다.
+      const nyHour      = Number(Utilities.formatDate(now, "America/New_York", "HH"));
+      const nyMinute    = Number(Utilities.formatDate(now, "America/New_York", "mm"));
+      const nyDayOfWeek = Number(Utilities.formatDate(now, "America/New_York", "u")) % 7;
+      if (nyDayOfWeek === 0 || nyDayOfWeek === 6) return false;
+      return (nyHour > 9 || (nyHour === 9 && nyMinute >= 30)) && (nyHour < 16);
     }
   },
 
@@ -837,15 +843,16 @@ const Utils = {
                      && cCond1 && cCond2 && cCond3 && cCond4 && cCond5 && cCond6
                      && nasdaqAllowsStrictMomentum;
 
-    // ── D그룹: MA200 위 + +DI>-DI + ADX>20 + ADX상승 + MACD>0 + %B 30-75 ──
+    // ── D그룹: MA200 위 + +DI>-DI + ADX>30 + ADX상승 + MACD>0 + %B 30-75 + IXIC≤13 ──
     const dCond1 = currentPrice !== null && ma200 !== null && currentPrice > ma200;
     const dCond2 = plusDI !== null && minusDI !== null && plusDI > minusDI;
     const dCond3 = adx !== null && adx > S.ADX_MIN;
     const dCond4 = adx !== null && adxD1 !== null && adx > adxD1;
     const dCond5 = macdHist !== null && macdHist > 0;
     const dCond6 = pctB !== null && pctB >= S.ADX_PCTB_MIN && pctB <= S.ADX_PCTB_MAX;
+    const dCond7 = Number.isFinite(ixicDist) && ixicDist <= S.D_NASDAQ_DIST_MAX;
     const entryGroupD = !entryGroupA && !entryGroupB && !entryGroupC
-                     && dCond1 && dCond2 && dCond3 && dCond4 && dCond5 && dCond6
+                     && dCond1 && dCond2 && dCond3 && dCond4 && dCond5 && dCond6 && dCond7
                      && nasdaqAllowsStrictMomentum;
 
     // ── E그룹: MA200 위 + BB스퀴즈 + 저가%B≤50 ─────────────────────────────
@@ -908,6 +915,7 @@ const Utils = {
                   : savedStrategy === "D" ? "200일선 상방 & 상승 흐름 강화"
                   : savedStrategy === "E" ? "200일선 상방 & 스퀴즈 저점"
                   : "200일선 상방 & BB 극단 저점";
+      const maxHoldDays = savedStrategy === "D" ? S.MAX_HOLD_DAYS_D : S.MAX_HOLD_DAYS;
 
       // E/F그룹만 MACD 게이트 (목표 도달 후 둔화전환 대기)
       const isEfStrategy = savedStrategy === "E" || savedStrategy === "F";
@@ -938,7 +946,7 @@ const Utils = {
 
       if (returnPct <= -circuitPct)                           return { opinion: "매도", reason: `손절 기준 도달 -${Math.abs(returnPct * 100).toFixed(2)}% [${label}]`, strategyType: savedStrategy };
       if (tradingDays >= S.HALF_EXIT_DAYS && returnPct > 0)  return { opinion: "매도", reason: "60거래일 경과 + 수익 중", strategyType: savedStrategy };
-      if (tradingDays >= S.MAX_HOLD_DAYS)                    return { opinion: "매도", reason: "최대 보유 기간 초과", strategyType: savedStrategy };
+      if (tradingDays >= maxHoldDays)                        return { opinion: "매도", reason: `최대 보유 기간 초과 (${maxHoldDays}일)`, strategyType: savedStrategy };
 
       if (buyTriggered) {
         if (isEventWatch) {
@@ -1581,6 +1589,7 @@ const Utils = {
                       : strategy === "D" ? "200일선 상방 & 상승 흐름 강화"
                       : strategy === "E" ? "200일선 상방 & 스퀴즈 저점"
                       : "200일선 상방 & BB 극단 저점";
+    const maxHoldDays = strategy === "D" ? S.MAX_HOLD_DAYS_D : S.MAX_HOLD_DAYS;
     const isEfStrategy = strategy === "E" || strategy === "F";
     let upperExitArmDate = isEfStrategy ? Utils.loadSlotUpperExitArm(stockName, strategy, allProperties) : null;
 
@@ -1607,7 +1616,7 @@ const Utils = {
 
     if (!isEfStrategy && returnPct >= targetPct) return { reason: `목표 수익 달성 +${(returnPct * 100).toFixed(2)}% [${label}]` };
     if (tradingDays >= S.HALF_EXIT_DAYS && returnPct > 0) return { reason: `60거래일 경과 + 수익 중 [${label}]` };
-    if (tradingDays >= S.MAX_HOLD_DAYS)          return { reason: `최대 보유 기간 초과 [${label}]` };
+    if (tradingDays >= maxHoldDays)              return { reason: `최대 보유 기간 초과 (${maxHoldDays}일) [${label}]` };
     return null;
   },
 

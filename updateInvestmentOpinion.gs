@@ -53,9 +53,9 @@ const CONSTANTS = {
     SQUEEZE_BREAKOUT_VOL_RATIO: 1.5,  // 거래량/20일평균 ≥ 1.5
     SQUEEZE_BREAKOUT_PCTB_MIN:  55,   // 종가 %B > 55
     // ── D그룹 (NEW | 200일선 상방 & 상승 흐름 강화) ──────────────────────────
-    // MA200 위 + +DI>-DI + ADX>30 + ADX상승 + MACD>0 + %B 30-75 + IXIC≤13 → +20% 즉시 매도
-    TARGET_PCT_D:    0.20,
-    CIRCUIT_PCT_D:   0.30,
+    // MA200 위 + +DI>-DI + ADX>30 + ADX상승 + MACD>0 + %B 30-75 + IXIC≤13 → +12% / -25% / 30거래일
+    TARGET_PCT_D:    0.12,
+    CIRCUIT_PCT_D:   0.25,
     ADX_MIN:         30,
     ADX_PCTB_MIN:    30,
     ADX_PCTB_MAX:    75,
@@ -74,6 +74,7 @@ const CONSTANTS = {
     // ── 공통 청산/복원 파라미터 ───────────────────────────────────────────────
     HALF_EXIT_DAYS:    60,
     MAX_HOLD_DAYS:     120,
+    MAX_HOLD_DAYS_D:   30,
     SELL_HOLD_HOURS:   48,
     REENTRY_DAYS:      10,
     REENTRY_DROP:      0.03,
@@ -298,12 +299,16 @@ function checkMarketOpen(now, isKR = false) {
   const kstHour      = Number(Utilities.formatDate(now, "Asia/Seoul", "HH"));
   const kstMinute    = Number(Utilities.formatDate(now, "Asia/Seoul", "mm"));
   const kstDayOfWeek = Number(Utilities.formatDate(now, "Asia/Seoul", "u")) % 7;
-  if (kstDayOfWeek === 0 || kstDayOfWeek === 6) return false;
   if (isKR) {
+    if (kstDayOfWeek === 0 || kstDayOfWeek === 6) return false;
     return (kstHour > 9 || (kstHour === 9 && kstMinute >= 0)) && (kstHour < 15 || (kstHour === 15 && kstMinute <= 30));
   } else {
-    const [openHour, closeHour] = isDaylightSaving(now) ? [22, 5] : [23, 6];
-    return (kstHour === openHour && kstMinute >= 30) || (kstHour > openHour && kstHour < 24) || (kstHour >= 0 && kstHour < closeHour);
+    // 미국장은 뉴욕 현지 요일/시간으로 판정해야 KST 자정 이후(뉴욕 전일 장중)를 오판하지 않는다.
+    const nyHour      = Number(Utilities.formatDate(now, "America/New_York", "HH"));
+    const nyMinute    = Number(Utilities.formatDate(now, "America/New_York", "mm"));
+    const nyDayOfWeek = Number(Utilities.formatDate(now, "America/New_York", "u")) % 7;
+    if (nyDayOfWeek === 0 || nyDayOfWeek === 6) return false;
+    return (nyHour > 9 || (nyHour === 9 && nyMinute >= 30)) && (nyHour < 16);
   }
 }
 
@@ -653,6 +658,7 @@ function evaluateExitCondition(ind, now, nasdaqPeakAlert, strategyType = "A", al
                    : strategyType === "D" ? `200일선 상방 & 상승 흐름 강화 기준 +${targetPct * 100}%`
                    : strategyType === "E" ? `200일선 상방 & 스퀴즈 저점 기준 +${targetPct * 100}%`
                    :                        `200일선 상방 & BB 극단 저점 기준 +${targetPct * 100}%`;
+  const maxHoldDays = strategyType === "D" ? S.MAX_HOLD_DAYS_D : S.MAX_HOLD_DAYS;
 
   const returnPct   = (ind.currentPrice - ind.entryPrice) / ind.entryPrice;
   const tradingDays = calcTradingDays(ind.entryDate, now);
@@ -686,7 +692,7 @@ function evaluateExitCondition(ind, now, nasdaqPeakAlert, strategyType = "A", al
 
   if (returnPct <= -circuitPct)    return { shouldExit: true, reason: `손절 기준 도달 -${Math.abs(returnPct * 100).toFixed(2)}% [손절 -${circuitPct * 100}%]` };
   if (tradingDays >= S.HALF_EXIT_DAYS && returnPct > 0) return { shouldExit: true, reason: `60거래일 경과 + 수익 중 자동 매도 (${tradingDays}일, +${(returnPct * 100).toFixed(2)}%)` };
-  if (tradingDays >= S.MAX_HOLD_DAYS)  return { shouldExit: true, reason: `최대 보유 기간 초과 자동 매도 (${tradingDays}일, ${(returnPct * 100).toFixed(2)}%)` };
+  if (tradingDays >= maxHoldDays)  return { shouldExit: true, reason: `최대 보유 기간 초과 자동 매도 (${tradingDays}일, ${(returnPct * 100).toFixed(2)}%) [한도 ${maxHoldDays}일]` };
 
   return { shouldExit: false, reason: null };
 }
