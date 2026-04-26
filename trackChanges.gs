@@ -36,7 +36,7 @@ function trackChanges() {
 
   console.log(`[분석 완료] 변경: ${changes.length}건, 현재 매수 의견: ${buyOpinions.length}개(${buyOpinions.length > 0 ? buyOpinions.join(", ") : "없음"}), 현재 매도 의견: ${sellOpinions.length}개(${sellOpinions.length > 0 ? sellOpinions.join(", ") : "없음"})`);
   if (changes.length > 0) {
-    const emailSent = Utils.sendEmailAlert(targetSheet.getRange("F1").getValue(), changes, buyOpinions, sellOpinions, kstDate, estString);
+    const emailSent = Utils.sendEmailAlert(targetSheet.getRange("F1").getValue(), changes, buyOpinions, sellOpinions, kstDate, estString, currentGlobalData);
     if (!emailSent) {
       console.log("[이메일 미발송] lastValues 저장 보류 — 다음 실행에서 동일 변경 재시도");
       throw new Error("투자의견 변경 이메일 발송 실패");
@@ -604,7 +604,10 @@ const Utils = {
     const event     = String(targetSheet.getRange("M1").getValue()).trim() || "당분간 없음";
     const vixToday  = Number(targetSheet.getRange("O1").getValue()) || 0;
     const ixicPrice = Number(targetSheet.getRange("W1").getValue()) || 0;
+    const ixicMa60  = Number(targetSheet.getRange("AA1").getValue()) || 0;
     const ixicMa200 = Number(targetSheet.getRange("AE1").getValue()) || 0;
+    const us10y     = Number(targetSheet.getRange("AO1").getValue()) || 0;
+    const dxy       = Number(targetSheet.getRange("AQ1").getValue()) || 0;
     const ixicDist  = (ixicPrice > 0 && ixicMa200 > 0) ? (ixicPrice / ixicMa200 - 1) * 100 : 100;
     const ixicFilterActive = typeof computeNasdaqABFilterActive === "function"
       ? computeNasdaqABFilterActive(ixicDist)
@@ -612,7 +615,46 @@ const Utils = {
     const nasdaqPeakAlert = allProperties
       ? allProperties["NasdaqPeakSellState"] === "TRUE"
       : PropertiesService.getScriptProperties().getProperty("NasdaqPeakSellState") === "TRUE";
-    return { vixToday, event, ixicDist, ixicFilterActive, nasdaqPeakAlert };
+    const macroRisk = {
+      highRate:     us10y >= 4.5,
+      strongDollar: dxy >= 105,
+      techWeak:     ixicPrice > 0 && ixicMa60 > 0 ? ixicPrice < ixicMa60 : false
+    };
+    return { vixToday, event, ixicPrice, ixicMa60, ixicDist, ixicFilterActive, nasdaqPeakAlert, us10y, dxy, macroRisk };
+  },
+
+  buildMacroContextHtml(globalData) {
+    if (!globalData) return "";
+
+    const fmtPct = v => (v === null || v === undefined || isNaN(v))
+      ? "데이터 없음"
+      : `${Number(v).toFixed(2)}%`;
+    const fmtIdx = v => (v === null || v === undefined || isNaN(v))
+      ? "데이터 없음"
+      : Number(v).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+    const hasNasdaqData = Number(globalData.ixicPrice) > 0 && Number(globalData.ixicMa60) > 0;
+    const nasdaqStatus = hasNasdaqData
+      ? `${fmtIdx(globalData.ixicPrice)} / 60일선 ${fmtIdx(globalData.ixicMa60)} (${globalData.macroRisk && globalData.macroRisk.techWeak ? "하회" : "상회"})`
+      : "데이터 없음";
+
+    const activeFlags = [];
+    if (globalData.macroRisk && globalData.macroRisk.highRate) activeFlags.push("고금리");
+    if (globalData.macroRisk && globalData.macroRisk.strongDollar) activeFlags.push("강달러");
+    if (globalData.macroRisk && globalData.macroRisk.techWeak) activeFlags.push("기술주 약세");
+
+    const statusLine = activeFlags.length > 0
+      ? `현재 체크 구간: <strong style="color:#c0392b;">${activeFlags.join(" · ")}</strong>`
+      : `현재 체크 구간: <strong style="color:#27ae60;">해당 없음</strong>`;
+
+    return (
+      `<div style="margin:12px 0 14px;padding:10px 12px;background:#fff8e8;border-left:3px solid #f39c12;font-size:13px;color:#444;">` +
+      `<strong>매크로 참고</strong><br>` +
+      `단, 고금리(미국 10년물 4.5% 이상), 강달러(달러 인덱스 105 이상), 기술주 약세(나스닥 60일선 하회) 구간에서는 적자 성장주보다 <strong>실적이 확인되는 종목</strong>을 우선할 것을 권장합니다.<br>` +
+      `현재값: 미국 10년물 <strong>${fmtPct(globalData.us10y)}</strong> · 달러 인덱스 <strong>${fmtIdx(globalData.dxy)}</strong> · 나스닥 <strong>${nasdaqStatus}</strong><br>` +
+      `${statusLine}` +
+      `</div>`
+    );
   },
 
   getLastValues() {
@@ -1734,7 +1776,7 @@ const Utils = {
     if (updateCount === 0) console.log(`[로깅 건너띔] ${stockName}: 청산할 매수 기록 없음`);
   },
 
-  sendEmailAlert(recipientEmail, changes, buyOpinions, sellOpinions, kstDate, estString) {
+  sendEmailAlert(recipientEmail, changes, buyOpinions, sellOpinions, kstDate, estString, globalData) {
     const stockSymbols = changes.map(c => c.ticker).join(", ");
     const changesHtml  = changes.map((c, i) => {
       const isBuySignal  = c.to === "매수" || c.to.includes("매수");
@@ -1760,10 +1802,13 @@ const Utils = {
       );
     }).join("");
 
+    const macroContextHtml = Utils.buildMacroContextHtml(globalData);
+
     const emailBody = `
     <div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.6;max-width:600px;">
       <p style="font-size:16px;font-weight:bold;color:#333;border-bottom:2px solid #eee;padding-bottom:8px;">투자의견이 변경된 종목이 있습니다.</p>
-      <div>${changesHtml}</div><br>
+      <div>${changesHtml}</div>
+      ${macroContextHtml}
       <p style="margin:0;"><strong>현재 매수 의견 종목:</strong> ${buyOpinions.length > 0 ? buyOpinions.join(", ") : "없음"}</p>
       <p style="margin:0;"><strong>현재 매도 의견 종목:</strong> ${sellOpinions.length > 0 ? sellOpinions.join(", ") : "없음"}</p><br>
       <p style="color:#888;font-size:12px;">발송 시각 (한국): ${kstDate}<br>발송 시각 (미 동부): ${estString}</p>
