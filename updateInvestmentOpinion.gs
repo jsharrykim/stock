@@ -13,80 +13,61 @@ const CONSTANTS = {
     pctBLow:      38,
     candleLow:    27,
     bbWidth:      41,
-    bbWidthD1:    42,  // BB폭 D-1 (AQ열 추정 — 확인 필요)
+    bbWidthD1:    42,
     bbWidthAvg60: 43,
     ma200:        49,
     lrTrendline:  50,
     entryPrice:    52,
     entryDate:     53,
-    entryStrategy: 54,  // BC열 — 진입 전략 그룹 (Script Properties 유실 시 복구용)
-    // ── C/D그룹 신규 컬럼 — 시트에서 인덱스 확인 후 수정 ─────────────────────
-    volRatio:  35,  // 20일 평균 대비 거래량 (AJ열) — C그룹 ④
-    plusDI:    19,  // +DI (DMI, T열) — D그룹 ③
-    minusDI:   20,  // -DI (DMI, U열) — D그룹 ③
-    adx:       21,  // ADX D (V열) — D그룹 ④⑤
-    adxD1:     22,  // ADX D-1 (W열) — D그룹 ⑤ 기울기
+    entryStrategy: 54,
+    volRatio:  35,
+    plusDI:    19,
+    minusDI:   20,
+    adx:       21,
+    adxD1:     22,
   },
   STRATEGY: {
-    // ── 공통 과매도/VIX ─────────────────────────────────────────────────────
     VIX_MIN:         30,
     VIX_RELEASE:     23,
     RSI_MAX:         35,
     CCI_MIN:        -150,
     LR_TOUCH_RATIO:  1.05,
-    // ── A그룹 (구 C | 200일선 상방 & 모멘텀 재가속) ──────────────────────────
-    // MA200 위 + MACD 골든크로스 + 종가%B > 80 + RSI > 70 → +20% 즉시 매도
     TARGET_PCT_A:           0.20,
     CIRCUIT_PCT_A:          0.30,
     GOLDEN_CROSS_PCTB_MIN:  80,
     GOLDEN_CROSS_RSI_MIN:   70,
-    // ── B그룹 (구 D | 200일선 하방 & 공황 저점) ──────────────────────────────
-    // MA200 아래 + VIX≥25 + 과매도 + 추세선 터치 → +20% 즉시 매도
     TARGET_PCT_B:    0.20,
     CIRCUIT_PCT_B:   0.30,
-    // ── C그룹 (NEW | 200일선 상방 & 스퀴즈 거래량 돌파) ─────────────────────
-    // MA200 위 + 전일 스퀴즈 + 당일 BB확장 + 거래량≥1.5배 + %B>55 + MACD>0 → +18% 즉시 매도
     TARGET_PCT_C:              0.20,
     CIRCUIT_PCT_C:             0.30,
-    C_SQUEEZE_RATIO:           0.45,  // 전일 BB폭 / 60일평균 < 0.45
-    BB_EXPAND_RATIO:           1.00,  // 당일 BB폭 > 전일 × 1.00
-    SQUEEZE_BREAKOUT_VOL_RATIO: 1.5,  // 거래량/20일평균 ≥ 1.5
-    SQUEEZE_BREAKOUT_PCTB_MIN:  55,   // 종가 %B > 55
-    // ── D그룹 (NEW | 200일선 상방 & 상승 흐름 강화) ──────────────────────────
-    // MA200 위 + +DI>-DI + ADX>30 + ADX상승 + MACD>0 + %B 30-75 + IXIC≤13 → +12% / -25% / 30거래일
+    C_SQUEEZE_RATIO:           0.45,
+    BB_EXPAND_RATIO:           1.00,
+    SQUEEZE_BREAKOUT_VOL_RATIO: 1.5,
+    SQUEEZE_BREAKOUT_PCTB_MIN:  55,
     TARGET_PCT_D:    0.12,
     CIRCUIT_PCT_D:   0.25,
     ADX_MIN:         30,
     ADX_PCTB_MIN:    30,
     ADX_PCTB_MAX:    75,
     D_NASDAQ_DIST_MAX: 13,
-    // ── E그룹 (구 A | 200일선 상방 & 스퀴즈 저점) ────────────────────────────
-    // MA200 위 + BB스퀴즈 + 저가%B≤50 → +8% MACD 둔화전환 대기 (최대 5일)
     TARGET_PCT_E:    0.20,
     CIRCUIT_PCT_E:   0.30,
     SQUEEZE_RATIO:   0.5,
     SQUEEZE_PCT_B_MAX: 50,
-    // ── F그룹 (구 B | 200일선 상방 & BB 극단 저점) ───────────────────────────
-    // MA200 위 + 저가%B≤5 → +8% MACD 둔화전환 대기 (최대 5일)
     TARGET_PCT_F:    0.20,
     CIRCUIT_PCT_F:   0.30,
     BB_PCT_B_LOW_MAX: 3,
-    // ── 공통 청산/복원 파라미터 ───────────────────────────────────────────────
     HALF_EXIT_DAYS:    60,
     MAX_HOLD_DAYS:     120,
     MAX_HOLD_DAYS_D:   30,
     SELL_HOLD_HOURS:   48,
     REENTRY_DAYS:      10,
     REENTRY_DROP:      0.03,
-    // 전략 공통 상단 과열 매수 차단
     NASDAQ_BUY_BLOCK_MAX: 9,
-    // 나스닥 하락장 필터 (A/C/D/E/F에 적용 | B그룹은 미적용)
-    NASDAQ_DIST_UPPER:   -3,    // 데스존 상한: 이 미만이면 차단 시작
-    NASDAQ_DIST_LOWER:   -12,   // 찐바닥: 이 이하이면 E/F 차단 해제 + 래치 OFF
-    NASDAQ_DIST_RELEASE: -2.5,  // 히스테리시스: 데스존 벗어난 뒤 이 이상일 때 차단 해제
-    // E/F그룹 MACD 게이트 최대 대기
+    NASDAQ_DIST_UPPER:   -3,
+    NASDAQ_DIST_LOWER:   -12,
+    NASDAQ_DIST_RELEASE: -2.5,
     UPPER_EXIT_MAX_WAIT_DAYS: 5,
-    // 보유 중 관망→매수 복원 조건 (A~F 공통 | 전 진입가 기준)
     HOLD_RESTORE_DROP:               0.03,
     HOLD_RESTORE_MIN_TRADING_DAYS:   3
   }
@@ -514,13 +495,9 @@ function evaluateBuyCondition(ind, vixD, ixicDist, ixicFilterActive, isHolding =
   const vixThreshold = isHolding ? S.VIX_RELEASE : S.VIX_MIN;
   const nasdaqBelowBuyBlock = Number.isFinite(ixicDist) && ixicDist <= S.NASDAQ_BUY_BLOCK_MAX;
 
-  // 나스닥 필터 구분
-  // strictMomentum (A, C, D): 강세장 전용 — 찐바닥 예외 없음, 이격도 ≥ -3% 필수
   const nasdaqAllowsStrictMomentum = nasdaqBelowBuyBlock && !ixicFilterActive && ixicDist >= S.NASDAQ_DIST_UPPER;
-  // bottomBuy (E, F): 찐바닥(≤ -12%)도 허용, 단 신규 진입은 9% 초과 시 차단
   const nasdaqAllowsBottomBuy = nasdaqBelowBuyBlock && !ixicFilterActive;
 
-  // ── A그룹: MA200 위 + MACD 골든크로스 + 종가%B > 80 + RSI > 70 ───────────
   const aCond1 = ind.currentPrice > ind.ma200;
   const aCond2 = ind.macdHistD1 !== null && ind.macdHistD1 <= 0
               && ind.macdHist   !== null && ind.macdHist   >  0;
@@ -528,7 +505,6 @@ function evaluateBuyCondition(ind, vixD, ixicDist, ixicFilterActive, isHolding =
   const aCond4 = ind.rsi  !== null && ind.rsi  > S.GOLDEN_CROSS_RSI_MIN;
   const entryGroupA = aCond1 && aCond2 && aCond3 && aCond4 && nasdaqAllowsStrictMomentum;
 
-  // ── B그룹: MA200 아래 + VIX≥25 + 과매도 + 추세선 터치 ────────────────────
   const hasRsi = ind.rsi !== null;
   const hasCci = ind.cci !== null;
   const rsiOk  = hasRsi && ind.rsi < S.RSI_MAX;
@@ -545,21 +521,19 @@ function evaluateBuyCondition(ind, vixD, ixicDist, ixicFilterActive, isHolding =
               && ind.candleLow  !== null && ind.candleLow <= ind.lrTrendline * S.LR_TOUCH_RATIO;
   const entryGroupB = bCond1 && bCond2 && bCond3 && bCond4 && bCond5 && nasdaqBelowBuyBlock;
 
-  // ── C그룹: MA200 위 + 전일 BB스퀴즈 + 당일 확장 + 거래량 폭발 ───────────
   const bbPairOk = ind.bbWidth !== null && ind.bbWidthAvg60 !== null && ind.bbWidthAvg60 > 0;
   const cCond1 = ind.currentPrice > ind.ma200;
   const cCond2 = bbPairOk && ind.bbWidthD1 !== null
-              && (ind.bbWidthD1 / ind.bbWidthAvg60) < S.C_SQUEEZE_RATIO;      // 전일 스퀴즈
+              && (ind.bbWidthD1 / ind.bbWidthAvg60) < S.C_SQUEEZE_RATIO;
   const cCond3 = bbPairOk && ind.bbWidthD1 !== null
-              && ind.bbWidth > ind.bbWidthD1 * S.BB_EXPAND_RATIO;             // 당일 확장
-  const cCond4 = ind.volRatio !== null && ind.volRatio >= S.SQUEEZE_BREAKOUT_VOL_RATIO; // 거래량 ≥ 1.5배
-  const cCond5 = ind.pctB !== null && ind.pctB > S.SQUEEZE_BREAKOUT_PCTB_MIN; // %B > 55
+              && ind.bbWidth > ind.bbWidthD1 * S.BB_EXPAND_RATIO;
+  const cCond4 = ind.volRatio !== null && ind.volRatio >= S.SQUEEZE_BREAKOUT_VOL_RATIO;
+  const cCond5 = ind.pctB !== null && ind.pctB > S.SQUEEZE_BREAKOUT_PCTB_MIN;
   const cCond6 = ind.macdHist !== null && ind.macdHist > 0;
   const entryGroupC = !entryGroupA && !entryGroupB
                    && cCond1 && cCond2 && cCond3 && cCond4 && cCond5 && cCond6
                    && nasdaqAllowsStrictMomentum;
 
-  // ── D그룹: MA200 위 + +DI>-DI + ADX>30 + ADX상승 + MACD>0 + %B 30-75 + IXIC≤13 ───
   const dCond1 = ind.currentPrice > ind.ma200;
   const dCond2 = ind.plusDI !== null && ind.minusDI !== null && ind.plusDI > ind.minusDI;
   const dCond3 = ind.adx !== null && ind.adx > S.ADX_MIN;
@@ -571,14 +545,12 @@ function evaluateBuyCondition(ind, vixD, ixicDist, ixicFilterActive, isHolding =
                    && dCond1 && dCond2 && dCond3 && dCond4 && dCond5 && dCond6 && dCond7
                    && nasdaqAllowsStrictMomentum;
 
-  // ── E그룹: MA200 위 + BB스퀴즈 + 저가%B≤50 ──────────────────────────────
   const eCond1 = ind.currentPrice > ind.ma200;
   const eCond2 = bbPairOk && (ind.bbWidth / ind.bbWidthAvg60) < S.SQUEEZE_RATIO;
   const eCond3 = ind.pctBLow !== null && ind.pctBLow <= S.SQUEEZE_PCT_B_MAX;
   const entryGroupE = !entryGroupA && !entryGroupB && !entryGroupC && !entryGroupD
                    && eCond1 && eCond2 && eCond3 && nasdaqAllowsBottomBuy;
 
-  // ── F그룹: MA200 위 + 저가%B≤5 ──────────────────────────────────────────
   const fCond1 = ind.currentPrice > ind.ma200;
   const fCond2 = ind.pctBLow !== null && ind.pctBLow <= S.BB_PCT_B_LOW_MAX;
   const entryGroupF = !entryGroupA && !entryGroupB && !entryGroupC && !entryGroupD && !entryGroupE
@@ -586,22 +558,17 @@ function evaluateBuyCondition(ind, vixD, ixicDist, ixicFilterActive, isHolding =
 
   const entryTriggered = entryGroupA || entryGroupB || entryGroupC || entryGroupD || entryGroupE || entryGroupF;
 
-  // ── 보유 중 매수 유지 판단 ─────────────────────────────────────────────────
   let triggered = entryTriggered;
   if (isHolding && holdingStrategyType) {
     if (holdingStrategyType === "A") {
-      // MA200 위 + MACD hist > 0 유지 + 나스닥 필터 (상단 과열 포함)
       const macdOk = ind.macdHist !== null && ind.macdHist > 0;
       triggered = aCond1 && !ixicFilterActive && nasdaqBelowBuyBlock && ixicDist >= S.NASDAQ_DIST_UPPER && macdOk;
     } else if (holdingStrategyType === "B") {
-      // bCond5(추세선 터치)는 진입 전용 — 보유 중에는 제외. 상단 과열 시 관망 전환
       triggered = bCond1 && bCond2 && bCond3Hold && bCond4 && nasdaqBelowBuyBlock;
     } else if (holdingStrategyType === "C") {
-      // MA200 위 + MACD hist > 0 (돌파는 일회성 이벤트 — 이후 모멘텀 유지 확인)
       const macdOkC = ind.macdHist !== null && ind.macdHist > 0;
       triggered = cCond1 && !ixicFilterActive && nasdaqBelowBuyBlock && ixicDist >= S.NASDAQ_DIST_UPPER && macdOkC;
     } else if (holdingStrategyType === "D") {
-      // MA200 위 + +DI>-DI + MACD>0 + 나스닥 필터 (상단 과열 포함)
       const diOk   = ind.plusDI !== null && ind.minusDI !== null && ind.plusDI > ind.minusDI;
       const macdOkD = ind.macdHist !== null && ind.macdHist > 0;
       triggered = dCond1 && !ixicFilterActive && nasdaqBelowBuyBlock && ixicDist >= S.NASDAQ_DIST_UPPER && diOk && macdOkD;
@@ -619,23 +586,15 @@ function evaluateBuyCondition(ind, vixD, ixicDist, ixicFilterActive, isHolding =
 
   return {
     triggered, strategyType,
-    // A그룹
     aCond1, aCond2, aCond3, aCond4,
-    // B그룹
     bCond1, bCond2, bCond3, bCond3Hold, bCond3Released, bCond4, bCond5,
     hasRsi, hasCci, rsiOk, cciOk, vixThreshold, lrSlope,
-    // C그룹
     cCond1, cCond2, cCond3, cCond4, cCond5, cCond6, bbPairOk,
-    // D그룹
     dCond1, dCond2, dCond3, dCond4, dCond5, dCond6, dCond7,
-    // E그룹
     eCond1, eCond2, eCond3,
-    // F그룹
     fCond1, fCond2,
-    // 나스닥 필터
     nasdaqAllowsStrictMomentum, nasdaqAllowsBottomBuy, nasdaqBelowBuyBlock, ixicDist, ixicFilterActive,
     entryTriggered,
-    // 레거시 alias (B그룹 로그에서 참조)
     cond2: bCond2, cond3: bCond3, cond3Hold: bCond3Hold,
     cond3Released: bCond3Released, cond4: bCond4, cond5: bCond5
   };
@@ -669,8 +628,6 @@ function evaluateExitCondition(ind, now, nasdaqPeakAlert, strategyType = "A", al
   const returnPct   = (ind.currentPrice - ind.entryPrice) / ind.entryPrice;
   const tradingDays = calcTradingDays(ind.entryDate, now);
 
-  // E/F그룹: MACD 둔화전환 + 최대 대기 출구 (평균회귀 전략)
-  // A/B/C/D그룹: 단순 목표수익 즉시 매도 (모멘텀/반등 전략)
   const isEfStrategy = strategyType === "E" || strategyType === "F";
   let upperExitArmDate = isEfStrategy ? loadUpperExitArm(ind.stockName, allProperties) : null;
 

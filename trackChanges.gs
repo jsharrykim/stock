@@ -78,17 +78,12 @@ function processData(currentData, currentGlobalData, lastEvent, currentValidOpin
       updatedOpinions[stockName] = { opinion: currentOpinion, reason: Utils.summarizeChangeReason(currentOpinion, currentOpinion, currentGlobalData, lastEvent, row, now, lastReason, allProperties) };
     }
 
-    // 멀티 슬롯: 보유 중에도 다른 전략 조건 독립 평가 (별도 진입/청산)
     processMultiSlots(stockName, row, currentGlobalData, now, allProperties, kstDate, changes, props);
   });
 
   return { changes, buyOpinions, sellOpinions, updatedOpinions };
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// 멀티 슬롯 평가: 보유 중 독립 슬롯 진입/청산 처리
-// SLOTS_${stockName} JSON 배열로 관리 — 전략 종류 무관, 각 슬롯 독립 청산
-// ──────────────────────────────────────────────────────────────────────────────
 function processMultiSlots(stockName, row, globalData, now, allProperties, kstDate, changes, props) {
   const C              = Utils.COL_INDICES;
   const S              = Utils.STRATEGY;
@@ -109,7 +104,6 @@ function processMultiSlots(stockName, row, globalData, now, allProperties, kstDa
     : s === "E" ? "E그룹 [스퀴즈 저점]"
     :             "F그룹 [BB 극단 저점]";
 
-  // ── 1. 기존 슬롯 청산 평가 ────────────────────────────────────────────────
   const activeSlots = Utils.loadSlots(stockName, allProperties);
 
   for (const slot of activeSlots) {
@@ -145,15 +139,12 @@ function processMultiSlots(stockName, row, globalData, now, allProperties, kstDa
     console.log(`[슬롯 매도] ${displayName} ${slot.strategy}그룹: ${slotExit.reason}`);
   }
 
-  // ── 2. 신규 슬롯 진입 평가 ────────────────────────────────────────────────
-  // ENTRY_ 없는 순수 관망 → 첫 진입은 handleOpinionChange 경로로 처리
   const primaryEntry = Utils.loadEntryInfoFrom(stockName, allProperties);
   if (!primaryEntry || primaryEntry.price <= 0) return;
 
   const STRATEGIES = ["A", "B", "C", "D", "E", "F"];
 
   for (const strategy of STRATEGIES) {
-    // 현재 시점 Props 기준 — 해당 전략 슬롯 이미 있으면 skip
     const liveProps  = props.getProperties();
     const liveSlots  = Utils.loadSlots(stockName, liveProps);
     if (liveSlots.some(s => s.strategy === strategy)) continue;
@@ -172,7 +163,6 @@ function processMultiSlots(stockName, row, globalData, now, allProperties, kstDa
       continue;
     }
 
-    // 매도 후 재진입 쿨다운 체크
     const slotSellVal = liveProps[`SLOT_SELL_${stockName}_${strategy}`] || allProperties[`SLOT_SELL_${stockName}_${strategy}`];
     if (slotSellVal) {
       const sellTime      = Utils.parseDateKST(slotSellVal.split("|")[0]);
@@ -189,7 +179,6 @@ function processMultiSlots(stockName, row, globalData, now, allProperties, kstDa
       }
     }
 
-    // 재진입 N회차 카운트
     const prevCount  = parseInt(liveProps[`REENTRY_COUNT_${stockName}`] || allProperties[`REENTRY_COUNT_${stockName}`] || "0");
     const newCount   = prevCount + 1;
     const cyclePrice = parseFloat(liveProps[`CYCLE_ENTRY_${stockName}`] || allProperties[`CYCLE_ENTRY_${stockName}`] || "0") || primaryEntry.price;
@@ -315,7 +304,28 @@ function handleOpinionChange(stockName, fromOpinion, toOpinion, row, currentGlob
     }
   }
   if (toOpinion === "매도" && fromOpinion !== "매도") {
-    Utils.recordAllOpenSellSignals(stockName, kstDate, price);
+    const isBulkSell = typeof reason === "string" && reason.indexOf("나스닥 고점 경고") !== -1;
+    let resolvedSellStrategy = existingEntry.strategyType;
+    if (!resolvedSellStrategy) {
+      const sheetStratStr = String(row[Utils.COL_INDICES.entryStrategy] || "").trim();
+      if (sheetStratStr) {
+        resolvedSellStrategy = sheetStratStr.charAt(0).toUpperCase();
+      }
+    }
+
+    if (isBulkSell) {
+      Utils.recordAllOpenSellSignals(stockName, kstDate, price);
+    } else {
+      if (!resolvedSellStrategy) {
+        console.log(`[경고] ${displayName}: 매도 신호 기록 시 전략 타입 미결정 — 레이블 없이 기록`);
+      }
+      Utils.recordSellSignal(
+        stockName,
+        kstDate,
+        price,
+        resolvedSellStrategy ? strategyDisplayName(resolvedSellStrategy) : ""
+      );
+    }
   }
 
   updatedOpinions[stockName] = { opinion: toOpinion, reason: Utils.summarizeChangeReason(toOpinion, toOpinion, currentGlobalData, lastEvent, row, now, reason, allProperties) };
@@ -420,19 +430,18 @@ const Utils = {
     pctBLow:      38,
     candleLow:    27,
     bbWidth:      41,
-    bbWidthD1:    42,  // BB폭 D-1 (AQ열 추정 — 확인 필요)
+    bbWidthD1:    42,
     bbWidthAvg60: 43,
     ma200:        49,
     lrTrendline:  50,
     entryPrice:   52,
     entryDate:    53,
     entryStrategy: 54,
-    // ── C/D그룹 신규 컬럼 — 시트에서 인덱스 확인 후 수정 ──────────────────
-    volRatio:  35,  // 20일 평균 대비 거래량 (AJ열) — C그룹 ④
-    plusDI:    19,  // +DI (DMI, T열) — D그룹 ③
-    minusDI:   20,  // -DI (DMI, U열) — D그룹 ③
-    adx:       21,  // ADX D (V열) — D그룹 ④⑤
-    adxD1:     22,  // ADX D-1 (W열) — D그룹 ⑤ 기울기
+    volRatio:  35,
+    plusDI:    19,
+    minusDI:   20,
+    adx:       21,
+    adxD1:     22,
   },
 
   STRATEGY: {
@@ -441,38 +450,31 @@ const Utils = {
     RSI_MAX:         35,
     CCI_MIN:        -150,
     LR_TOUCH_RATIO:  1.05,
-    // A그룹 (구 C | 200일선 상방 & 모멘텀 재가속): +20% 즉시
     TARGET_PCT_A:           0.20,
     CIRCUIT_PCT_A:          0.30,
     GOLDEN_CROSS_PCTB_MIN:  80,
     GOLDEN_CROSS_RSI_MIN:   70,
-    // B그룹 (구 D | 200일선 하방 & 공황 저점): +20% 즉시
     TARGET_PCT_B:    0.20,
     CIRCUIT_PCT_B:   0.30,
-    // C그룹 (NEW | 200일선 상방 & 스퀴즈 거래량 돌파): +18% 즉시
     TARGET_PCT_C:              0.20,
     CIRCUIT_PCT_C:             0.30,
     C_SQUEEZE_RATIO:           0.45,
     BB_EXPAND_RATIO:           1.00,
     SQUEEZE_BREAKOUT_VOL_RATIO: 1.5,
     SQUEEZE_BREAKOUT_PCTB_MIN:  55,
-    // D그룹 (NEW | 200일선 상방 & 상승 흐름 강화): +12% / -25% / 30거래일
     TARGET_PCT_D:    0.12,
     CIRCUIT_PCT_D:   0.25,
     ADX_MIN:         30,
     ADX_PCTB_MIN:    30,
     ADX_PCTB_MAX:    75,
     D_NASDAQ_DIST_MAX: 13,
-    // E그룹 (구 A | 200일선 상방 & 스퀴즈 저점): +8% MACD 게이트
     TARGET_PCT_E:    0.20,
     CIRCUIT_PCT_E:   0.30,
     SQUEEZE_RATIO:   0.5,
     SQUEEZE_PCT_B_MAX: 50,
-    // F그룹 (구 B | 200일선 상방 & BB 극단 저점): +8% MACD 게이트
     TARGET_PCT_F:    0.20,
     CIRCUIT_PCT_F:   0.30,
     BB_PCT_B_LOW_MAX: 3,
-    // 공통
     HALF_EXIT_DAYS:    60,
     MAX_HOLD_DAYS:     120,
     MAX_HOLD_DAYS_D:   30,
@@ -954,10 +956,7 @@ const Utils = {
     const savedStrategy = isHolding ? (saved.strategyType || "A") : null;
     const vixThreshold  = isHolding ? S.VIX_RELEASE : S.VIX_MIN;
 
-    // 나스닥 필터
-    // strictMomentum (A/C/D): 강세장 전용 — 이격도 ≥ -3%, 찐바닥 예외 없음
     const nasdaqAllowsStrictMomentum = nasdaqBelowBuyBlock && !ixicFilterActive && ixicDist >= S.NASDAQ_DIST_UPPER;
-    // bottomBuy (E/F): 히스테리시스 + 찐바닥(≤ -12%) 허용, 단 신규 진입은 9% 초과 시 차단
     const nasdaqAllowsBottomBuy = nasdaqBelowBuyBlock && !ixicFilterActive;
 
     const hasRsi = rsi !== null;
@@ -968,14 +967,12 @@ const Utils = {
     const bCond3Hold = (hasRsi || hasCci) && bCond3;
     const bbPairOk   = bbWidth !== null && bbWidthAvg60 !== null && bbWidthAvg60 > 0;
 
-    // ── A그룹: MA200 위 + MACD 골든크로스 + %B>80 + RSI>70 ──────────────────
     const aCond1 = currentPrice !== null && ma200 !== null && currentPrice > ma200;
     const aCond2 = macdHistD1 !== null && macdHist !== null && macdHistD1 <= 0 && macdHist > 0;
     const aCond3 = pctB !== null && pctB > S.GOLDEN_CROSS_PCTB_MIN;
     const aCond4 = rsi !== null && rsi > S.GOLDEN_CROSS_RSI_MIN;
     const entryGroupA = aCond1 && aCond2 && aCond3 && aCond4 && nasdaqAllowsStrictMomentum;
 
-    // ── B그룹: MA200 아래 + VIX + 과매도 + 추세선 ───────────────────────────
     const bCond1 = currentPrice !== null && ma200 !== null && currentPrice < ma200;
     const bCond2 = vixToday >= vixThreshold;
     const lrSlope = (typeof getLRSlope === "function") ? getLRSlope(stockName) : 0;
@@ -983,7 +980,6 @@ const Utils = {
     const bCond5 = lrTrendline !== null && lrTrendline > 0 && candleLow !== null && candleLow <= lrTrendline * S.LR_TOUCH_RATIO;
     const entryGroupB = bCond1 && bCond2 && bCond3 && bCond4 && bCond5 && nasdaqBelowBuyBlock;
 
-    // ── C그룹: MA200 위 + 전일 스퀴즈 + 당일 BB확장 + 거래량 폭발 ────────────
     const cCond1 = currentPrice !== null && ma200 !== null && currentPrice > ma200;
     const cCond2 = bbPairOk && bbWidthD1 !== null && (bbWidthD1 / bbWidthAvg60) < S.C_SQUEEZE_RATIO;
     const cCond3 = bbPairOk && bbWidthD1 !== null && bbWidth > bbWidthD1 * S.BB_EXPAND_RATIO;
@@ -994,7 +990,6 @@ const Utils = {
                      && cCond1 && cCond2 && cCond3 && cCond4 && cCond5 && cCond6
                      && nasdaqAllowsStrictMomentum;
 
-    // ── D그룹: MA200 위 + +DI>-DI + ADX>30 + ADX상승 + MACD>0 + %B 30-75 + IXIC≤13 ──
     const dCond1 = currentPrice !== null && ma200 !== null && currentPrice > ma200;
     const dCond2 = plusDI !== null && minusDI !== null && plusDI > minusDI;
     const dCond3 = adx !== null && adx > S.ADX_MIN;
@@ -1006,14 +1001,12 @@ const Utils = {
                      && dCond1 && dCond2 && dCond3 && dCond4 && dCond5 && dCond6 && dCond7
                      && nasdaqAllowsStrictMomentum;
 
-    // ── E그룹: MA200 위 + BB스퀴즈 + 저가%B≤50 ─────────────────────────────
     const eCond1 = currentPrice !== null && ma200 !== null && currentPrice > ma200;
     const eCond2 = bbPairOk && (bbWidth / bbWidthAvg60) < S.SQUEEZE_RATIO;
     const eCond3 = pctBLow !== null && pctBLow <= S.SQUEEZE_PCT_B_MAX;
     const entryGroupE = !entryGroupA && !entryGroupB && !entryGroupC && !entryGroupD
                      && eCond1 && eCond2 && eCond3 && nasdaqAllowsBottomBuy;
 
-    // ── F그룹: MA200 위 + 저가%B≤5 ──────────────────────────────────────────
     const fCond1 = currentPrice !== null && ma200 !== null && currentPrice > ma200;
     const fCond2 = pctBLow !== null && pctBLow <= S.BB_PCT_B_LOW_MAX;
     const entryGroupF = !entryGroupA && !entryGroupB && !entryGroupC && !entryGroupD && !entryGroupE
@@ -1068,7 +1061,6 @@ const Utils = {
                   : "200일선 상방 & BB 극단 저점";
       const maxHoldDays = savedStrategy === "D" ? S.MAX_HOLD_DAYS_D : S.MAX_HOLD_DAYS;
 
-      // E/F그룹만 MACD 게이트 (목표 도달 후 둔화전환 대기)
       const isEfStrategy = savedStrategy === "E" || savedStrategy === "F";
       let upperExitArmDate = isEfStrategy ? Utils.loadUpperExitArmFrom(stockName, allProperties) : null;
 
@@ -1090,7 +1082,6 @@ const Utils = {
         }
       }
 
-      // A/B/C/D: 단순 목표수익 즉시 매도
       if (!isEfStrategy && returnPct >= targetPct) {
         return { opinion: "매도", reason: `목표 수익 달성 즉시 매도 +${(returnPct * 100).toFixed(2)}% [${label}]`, strategyType: savedStrategy };
       }
