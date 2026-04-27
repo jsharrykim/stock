@@ -1,5 +1,5 @@
 /**
- * earningsAlert.gs
+ * sendEarningsAlert.gs
  * 실적발표 전날 알림 메일 — 매일 밤 9시 KST 트리거
  *
  * 실적발표 D-1 종목은 기술분석 시트 AZ열의 "(D-1)" 값으로 판단
@@ -183,7 +183,7 @@ function _earningsBuildEmailBody(stocks, trendData, globalData, kstDate, estDate
       `<strong style="font-size:15px;">${s.ticker}</strong>` +
       `&nbsp;<span style="font-size:12px;color:#fff;background:${badgeBg};padding:1px 6px;border-radius:3px;">${s.opinion}</span>` +
       `<br>` +
-      `<span style="font-size:13px;">발표일: <strong>${s.date.replace(/-/g, ".")} (한국시간)</strong></span><br>` +
+      `<span style="font-size:13px;">발표일: <strong>${s.date.replace(/-/g, ".")}</strong></span><br>` +
       (s.industry   ? `<span style="font-size:12px;color:#666;">산업: ${s.industry}</span><br>` : "") +
       (s.trendBadge ? `<span style="font-size:12px;color:#e67e22;">${s.trendBadge}</span><br>` : "") +
       `<br>` +
@@ -225,7 +225,7 @@ function _earningsBuildEmailBody(stocks, trendData, globalData, kstDate, estDate
 // 이메일 발송
 function _earningsSendEmail(recipientEmail, stocks, trendData, globalData, kstDate, estDate) {
   const tickerList = stocks.map(s => s.ticker).join(", ");
-  const subject    = `[실적발표] ${tickerList} — 내일 발표`;
+  const subject    = `[실적발표 D-1] ${tickerList} — 내일 발표`;
   const htmlBody   = _earningsBuildEmailBody(stocks, trendData, globalData, kstDate, estDate);
 
   const maxAttempts = 3;
