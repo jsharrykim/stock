@@ -36,7 +36,7 @@ function trackChanges() {
 
   console.log(`[분석 완료] 변경: ${changes.length}건, 현재 매수 의견: ${buyOpinions.length}개(${buyOpinions.length > 0 ? buyOpinions.join(", ") : "없음"}), 현재 매도 의견: ${sellOpinions.length}개(${sellOpinions.length > 0 ? sellOpinions.join(", ") : "없음"})`);
   if (changes.length > 0) {
-    const emailSent = Utils.sendEmailAlert(targetSheet.getRange("F1").getValue(), changes, buyOpinions, sellOpinions, kstDate, estString, currentGlobalData);
+    const emailSent = Utils.sendEmailAlert(targetSheet.getRange("F1").getValue(), changes, buyOpinions, sellOpinions, kstDate, estString, currentGlobalData, trendData);
     if (!emailSent) {
       console.log("[이메일 미발송] lastValues 저장 보류 — 다음 실행에서 동일 변경 재시도");
       throw new Error("투자의견 변경 이메일 발송 실패");
@@ -321,6 +321,85 @@ function handleOpinionChange(stockName, fromOpinion, toOpinion, row, currentGlob
   updatedOpinions[stockName] = { opinion: toOpinion, reason: Utils.summarizeChangeReason(toOpinion, toOpinion, currentGlobalData, lastEvent, row, now, reason, allProperties) };
 }
 
+var NASDAQ_PEAK_SIGNAL_CONFIG = {
+  currentPriceCell: "W1",
+  vixTodayCell: "O1",
+  vixYesterdayCell: "Q1",
+  ma200Cell: "AE1",
+  multiplier: 1.12,
+  vixThreshold: 18,
+  vixSurgePercent: 10,
+  stateKey: "NasdaqPeakSellState",
+  dailyReachedKey: "NasdaqPeakReachedToday",
+  lastResetDateKey: "NasdaqPeakLastResetDate"
+};
+
+function getNasdaqPeakSignalState_(targetSheet, allProperties) {
+  const cfg = NASDAQ_PEAK_SIGNAL_CONFIG;
+  const props = PropertiesService.getScriptProperties();
+  const now = new Date();
+  const kstDateOnly = Utilities.formatDate(now, "Asia/Seoul", "yyyy-MM-dd");
+
+  const cached = allProperties || props.getProperties();
+  const lastResetDate = cached[cfg.lastResetDateKey] || props.getProperty(cfg.lastResetDateKey);
+  if (lastResetDate !== kstDateOnly) {
+    props.setProperty(cfg.dailyReachedKey, "FALSE");
+    props.setProperty(cfg.lastResetDateKey, kstDateOnly);
+  }
+
+  const currentPrice = Number(targetSheet.getRange(cfg.currentPriceCell).getValue()) || 0;
+  const vixToday = Number(targetSheet.getRange(cfg.vixTodayCell).getValue()) || 0;
+  const vixYesterday = Number(targetSheet.getRange(cfg.vixYesterdayCell).getValue()) || 0;
+  const nasdaqMA200 = Number(targetSheet.getRange(cfg.ma200Cell).getValue()) || 0;
+
+  if (!(currentPrice > 0) || !(nasdaqMA200 > 0)) {
+    props.setProperty(cfg.stateKey, "FALSE");
+    return {
+      nasdaqPeakAlert: false,
+      currentPrice,
+      nasdaqMA200,
+      thresholdPrice: 0,
+      premiumPercent: 0,
+      vixToday,
+      vixYesterday,
+      vixChangePercent: 0,
+      isPeakReachedToday: false,
+      isVixConditionMet: false
+    };
+  }
+
+  const thresholdPrice = nasdaqMA200 * cfg.multiplier;
+  const premiumPercent = (currentPrice / nasdaqMA200 - 1) * 100;
+  const vixChangePercent = vixYesterday !== 0 ? ((vixToday / vixYesterday - 1) * 100) : 0;
+  const isVixConditionMet = vixToday > cfg.vixThreshold || vixChangePercent >= cfg.vixSurgePercent;
+
+  let peakReachedToday = (cached[cfg.dailyReachedKey] || props.getProperty(cfg.dailyReachedKey)) === "TRUE";
+  if (currentPrice > thresholdPrice && !peakReachedToday) {
+    props.setProperty(cfg.dailyReachedKey, "TRUE");
+    peakReachedToday = true;
+  }
+
+  const isPeakTriggered = peakReachedToday && isVixConditionMet;
+  if (isPeakTriggered) {
+    props.setProperty(cfg.stateKey, "TRUE");
+  } else if (currentPrice <= thresholdPrice) {
+    props.setProperty(cfg.stateKey, "FALSE");
+  }
+
+  return {
+    nasdaqPeakAlert: props.getProperty(cfg.stateKey) === "TRUE",
+    currentPrice,
+    nasdaqMA200,
+    thresholdPrice,
+    premiumPercent,
+    vixToday,
+    vixYesterday,
+    vixChangePercent,
+    isPeakReachedToday: peakReachedToday,
+    isVixConditionMet
+  };
+}
+
 const Utils = {
 
   _tradingLogSheetCache: null,
@@ -400,6 +479,7 @@ const Utils = {
     SELL_HOLD_HOURS:   48,
     REENTRY_DAYS:      10,
     REENTRY_DROP:      0.03,
+    NASDAQ_BUY_BLOCK_MAX: 9,
     NASDAQ_DIST_UPPER:   -3,
     NASDAQ_DIST_LOWER:   -12,
     NASDAQ_DIST_RELEASE: -2.5,
@@ -612,12 +692,12 @@ const Utils = {
     const ixicFilterActive = typeof computeNasdaqABFilterActive === "function"
       ? computeNasdaqABFilterActive(ixicDist)
       : ixicDist < Utils.STRATEGY.NASDAQ_DIST_UPPER && ixicDist > Utils.STRATEGY.NASDAQ_DIST_LOWER;
-    const nasdaqPeakAlert = allProperties
-      ? allProperties["NasdaqPeakSellState"] === "TRUE"
-      : PropertiesService.getScriptProperties().getProperty("NasdaqPeakSellState") === "TRUE";
+    const peakState = getNasdaqPeakSignalState_(targetSheet, allProperties);
+    const nasdaqPeakAlert = peakState.nasdaqPeakAlert;
     const macroRisk = {
-      highRate:     us10y >= 4.5,
-      strongDollar: dxy >= 105,
+      highRate:     us10y >= 4.2,
+      strongDollar: dxy >= 103,
+      highVix:      vixToday >= 20,
       techWeak:     ixicPrice > 0 && ixicMa60 > 0 ? ixicPrice < ixicMa60 : false
     };
     return { vixToday, event, ixicPrice, ixicMa60, ixicDist, ixicFilterActive, nasdaqPeakAlert, us10y, dxy, macroRisk };
@@ -632,6 +712,9 @@ const Utils = {
     const fmtIdx = v => (v === null || v === undefined || isNaN(v))
       ? "데이터 없음"
       : Number(v).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const fmtVix = v => (v === null || v === undefined || isNaN(v) || v === 0)
+      ? "데이터 없음"
+      : Number(v).toFixed(2);
 
     const hasNasdaqData = Number(globalData.ixicPrice) > 0 && Number(globalData.ixicMa60) > 0;
     const nasdaqStatus = hasNasdaqData
@@ -639,9 +722,10 @@ const Utils = {
       : "데이터 없음";
 
     const activeFlags = [];
-    if (globalData.macroRisk && globalData.macroRisk.highRate) activeFlags.push("고금리");
+    if (globalData.macroRisk && globalData.macroRisk.highRate)     activeFlags.push("고금리");
     if (globalData.macroRisk && globalData.macroRisk.strongDollar) activeFlags.push("강달러");
-    if (globalData.macroRisk && globalData.macroRisk.techWeak) activeFlags.push("기술주 약세");
+    if (globalData.macroRisk && globalData.macroRisk.highVix)      activeFlags.push("시장 불안(VIX)");
+    if (globalData.macroRisk && globalData.macroRisk.techWeak)     activeFlags.push("기술주 약세");
 
     const statusLine = activeFlags.length > 0
       ? `현재 체크 구간: <strong style="color:#c0392b;">${activeFlags.join(" · ")}</strong>`
@@ -650,9 +734,33 @@ const Utils = {
     return (
       `<div style="margin:12px 0 14px;padding:10px 12px;background:#fff8e8;border-left:3px solid #f39c12;font-size:13px;color:#444;">` +
       `<strong>매크로 참고</strong><br>` +
-      `단, 고금리(미국 10년물 4.5% 이상), 강달러(달러 인덱스 105 이상), 기술주 약세(나스닥 60일선 하회) 구간에서는 적자 성장주보다 <strong>실적이 확인되는 종목</strong>을 우선할 것을 권장합니다.<br>` +
-      `현재값: 미국 10년물 <strong>${fmtPct(globalData.us10y)}</strong> · 달러 인덱스 <strong>${fmtIdx(globalData.dxy)}</strong> · 나스닥 <strong>${nasdaqStatus}</strong><br>` +
+      `단, 고금리(미국 10년물 4.2% 이상), 강달러(달러 인덱스 103 이상), 시장 불안(VIX 20 이상), 기술주 약세(나스닥 60일선 하회) 구간에서는 적자 성장주보다 <strong>실적이 확인되는 종목</strong>을 우선할 것을 권장합니다.<br>` +
+      `현재값: 미국 10년물 <strong>${fmtPct(globalData.us10y)}</strong> · 달러 인덱스 <strong>${fmtIdx(globalData.dxy)}</strong> · VIX <strong>${fmtVix(globalData.vixToday)}</strong> · 나스닥 <strong>${nasdaqStatus}</strong><br>` +
       `${statusLine}` +
+      `</div>`
+    );
+  },
+
+  buildTrendTop3Html(trendData) {
+    if (!trendData || !trendData.ranks || trendData.ranks.length === 0) return "";
+    const top3 = trendData.ranks.filter(r => r.rank <= 3).sort((a, b) => a.rank - b.rank);
+    if (top3.length === 0) return "";
+    const rowsHtml = top3.map(r =>
+      `<div style="padding:5px 0;border-bottom:1px solid #e8f0fe;font-size:13px;">` +
+      `<span style="color:#3498db;font-weight:bold;min-width:28px;display:inline-block;">${r.rank}위</span>` +
+      `<strong style="color:#222;">${r.sector}</strong>` +
+      `<span style="color:#666;margin-left:8px;">${r.keywords}</span>` +
+      `</div>`
+    ).join("");
+    const dateStr = trendData.date ? ` (기준: ${trendData.date})` : "";
+    const summaryHtml = trendData.summary
+      ? `<div style="margin-top:8px;font-size:12px;color:#555;">※ ${trendData.summary}</div>`
+      : "";
+    return (
+      `<div style="margin:0 0 14px;padding:10px 12px;background:#f0f7ff;border-left:3px solid #3498db;font-size:13px;color:#444;">` +
+      `<strong>이번 주 시장 트렌드 Top 3</strong>${dateStr}<br>` +
+      `<div style="margin-top:6px;">${rowsHtml}</div>` +
+      summaryHtml +
       `</div>`
     );
   },
@@ -837,6 +945,7 @@ const Utils = {
     const currentOpinion  = String(row[C.opinion]).trim();
     const isEventWatch    = globalData.event !== "당분간 없음";
     const nasdaqPeakAlert = globalData.nasdaqPeakAlert;
+    const nasdaqBelowBuyBlock = Number.isFinite(ixicDist) && ixicDist <= S.NASDAQ_BUY_BLOCK_MAX;
 
     const saved         = Utils.loadEntryInfoFrom(stockName, allProperties);
     const entryPrice    = saved.price > 0 ? saved.price : (Utils.toNum(row[C.entryPrice]) || 0);
@@ -847,9 +956,9 @@ const Utils = {
 
     // 나스닥 필터
     // strictMomentum (A/C/D): 강세장 전용 — 이격도 ≥ -3%, 찐바닥 예외 없음
-    const nasdaqAllowsStrictMomentum = !ixicFilterActive && ixicDist >= S.NASDAQ_DIST_UPPER;
-    // bottomBuy (E/F): 히스테리시스 + 찐바닥(≤ -12%) 허용
-    const nasdaqAllowsBottomBuy = !ixicFilterActive;
+    const nasdaqAllowsStrictMomentum = nasdaqBelowBuyBlock && !ixicFilterActive && ixicDist >= S.NASDAQ_DIST_UPPER;
+    // bottomBuy (E/F): 히스테리시스 + 찐바닥(≤ -12%) 허용, 단 신규 진입은 9% 초과 시 차단
+    const nasdaqAllowsBottomBuy = nasdaqBelowBuyBlock && !ixicFilterActive;
 
     const hasRsi = rsi !== null;
     const hasCci = cci !== null;
@@ -872,7 +981,7 @@ const Utils = {
     const lrSlope = (typeof getLRSlope === "function") ? getLRSlope(stockName) : 0;
     const bCond4 = lrSlope > 0;
     const bCond5 = lrTrendline !== null && lrTrendline > 0 && candleLow !== null && candleLow <= lrTrendline * S.LR_TOUCH_RATIO;
-    const entryGroupB = bCond1 && bCond2 && bCond3 && bCond4 && bCond5;
+    const entryGroupB = bCond1 && bCond2 && bCond3 && bCond4 && bCond5 && nasdaqBelowBuyBlock;
 
     // ── C그룹: MA200 위 + 전일 스퀴즈 + 당일 BB확장 + 거래량 폭발 ────────────
     const cCond1 = currentPrice !== null && ma200 !== null && currentPrice > ma200;
@@ -917,20 +1026,20 @@ const Utils = {
     if (isHolding && entryPrice > 0 && entryDate) {
       if (savedStrategy === "A") {
         const macdOk = macdHist !== null && macdHist > 0;
-        buyTriggered = aCond1 && nasdaqAllowsStrictMomentum && macdOk;
+        buyTriggered = aCond1 && !ixicFilterActive && nasdaqBelowBuyBlock && ixicDist >= S.NASDAQ_DIST_UPPER && macdOk;
       } else if (savedStrategy === "B") {
-        buyTriggered = bCond1 && bCond2 && bCond3Hold && bCond4;
+        buyTriggered = bCond1 && bCond2 && bCond3Hold && bCond4 && nasdaqBelowBuyBlock;
       } else if (savedStrategy === "C") {
         const macdOkC = macdHist !== null && macdHist > 0;
-        buyTriggered = cCond1 && nasdaqAllowsStrictMomentum && macdOkC;
+        buyTriggered = cCond1 && !ixicFilterActive && nasdaqBelowBuyBlock && ixicDist >= S.NASDAQ_DIST_UPPER && macdOkC;
       } else if (savedStrategy === "D") {
         const diOk    = plusDI !== null && minusDI !== null && plusDI > minusDI;
         const macdOkD = macdHist !== null && macdHist > 0;
-        buyTriggered = dCond1 && nasdaqAllowsStrictMomentum && diOk && macdOkD;
+        buyTriggered = dCond1 && !ixicFilterActive && nasdaqBelowBuyBlock && ixicDist >= S.NASDAQ_DIST_UPPER && diOk && macdOkD;
       } else if (savedStrategy === "E") {
-        buyTriggered = eCond1 && nasdaqAllowsBottomBuy && bbPairOk && pctBLow !== null && eCond2 && eCond3;
+        buyTriggered = eCond1 && !ixicFilterActive && nasdaqBelowBuyBlock && bbPairOk && pctBLow !== null && eCond2 && eCond3;
       } else if (savedStrategy === "F") {
-        buyTriggered = fCond1 && nasdaqAllowsBottomBuy && pctBLow !== null && fCond2;
+        buyTriggered = fCond1 && !ixicFilterActive && nasdaqBelowBuyBlock && pctBLow !== null && fCond2;
       }
 
       if (nasdaqPeakAlert) return { opinion: "매도", reason: "나스닥 고점 경고 — 강제 매도", strategyType: savedStrategy };
@@ -1192,7 +1301,9 @@ const Utils = {
         const rawDeath = ixicDist > S.NASDAQ_DIST_LOWER && ixicDist < S.NASDAQ_DIST_UPPER;
         let releaseDetail;
 
-        if ((stratType === "E" || stratType === "F") && ixicFilterActive) {
+        if (Number.isFinite(ixicDist) && ixicDist > S.NASDAQ_BUY_BLOCK_MAX) {
+          releaseDetail = `나스닥 상단 과열 (IXIC 이격도 ${ixicDist.toFixed(1)}% > ${S.NASDAQ_BUY_BLOCK_MAX}%) — 과열 해소 시 자동 복원`;
+        } else if ((stratType === "E" || stratType === "F") && ixicFilterActive) {
           releaseDetail = rawDeath
             ? `나스닥 하락장 필터 진입 (IXIC 이격도 ${ixicDist.toFixed(1)}% → 데스존 ${S.NASDAQ_DIST_UPPER}% ~ ${S.NASDAQ_DIST_LOWER}%)`
             : `나스닥 E/F 차단 유지 (히스테리시스 IXIC 이격도 ${ixicDist.toFixed(1)}%, 해제 ≥ ${S.NASDAQ_DIST_RELEASE}%)`;
@@ -1542,13 +1653,14 @@ const Utils = {
     const adxD1        = C.adxD1     >= 0 ? Utils.toNum(row[C.adxD1])     : null;
     const { ixicFilterActive, ixicDist, nasdaqPeakAlert, vixToday } = globalData;
     const isEventWatch = globalData.event !== "당분간 없음";
+    const nasdaqBelowBuyBlock = Number.isFinite(ixicDist) && ixicDist <= S.NASDAQ_BUY_BLOCK_MAX;
 
     if (!currentPrice || !ma200) return false;
     if (nasdaqPeakAlert || isEventWatch) return false;
 
     const bbPairOk                 = bbWidth !== null && bbWidthAvg60 !== null && bbWidthAvg60 > 0;
-    const nasdaqAllowsStrictMomentum = !ixicFilterActive && (ixicDist !== undefined ? ixicDist : 100) >= S.NASDAQ_DIST_UPPER;
-    const nasdaqAllowsBottomBuy    = !ixicFilterActive;
+    const nasdaqAllowsStrictMomentum = nasdaqBelowBuyBlock && !ixicFilterActive && (ixicDist !== undefined ? ixicDist : 100) >= S.NASDAQ_DIST_UPPER;
+    const nasdaqAllowsBottomBuy    = nasdaqBelowBuyBlock && !ixicFilterActive;
     const hasRsi = rsi !== null, hasCci = cci !== null;
     const rsiOk  = hasRsi && rsi < S.RSI_MAX;
     const cciOk  = hasCci && cci < S.CCI_MIN;
@@ -1566,7 +1678,8 @@ const Utils = {
       return currentPrice < ma200
         && vixToday >= S.VIX_MIN && cond3 && lrSlope > 0
         && lrTrendline !== null && lrTrendline > 0
-        && candleLow !== null && candleLow <= lrTrendline * S.LR_TOUCH_RATIO;
+        && candleLow !== null && candleLow <= lrTrendline * S.LR_TOUCH_RATIO
+        && nasdaqBelowBuyBlock;
     }
     if (strategy === "C") {
       return currentPrice > ma200
@@ -1776,8 +1889,9 @@ const Utils = {
     if (updateCount === 0) console.log(`[로깅 건너띔] ${stockName}: 청산할 매수 기록 없음`);
   },
 
-  sendEmailAlert(recipientEmail, changes, buyOpinions, sellOpinions, kstDate, estString, globalData) {
+  sendEmailAlert(recipientEmail, changes, buyOpinions, sellOpinions, kstDate, estString, globalData, trendData = null) {
     const stockSymbols = changes.map(c => c.ticker).join(", ");
+    const hasBuyTransition = changes.some(c => c.to === "매수" && c.from !== "매수");
     const changesHtml  = changes.map((c, i) => {
       const isBuySignal  = c.to === "매수" || c.to.includes("매수");
       const isSellSignal = c.to === "매도" || c.to.includes("매도");
@@ -1802,13 +1916,15 @@ const Utils = {
       );
     }).join("");
 
-    const macroContextHtml = Utils.buildMacroContextHtml(globalData);
+    const macroContextHtml = hasBuyTransition ? Utils.buildMacroContextHtml(globalData) : "";
+    const trendTop3Html    = hasBuyTransition ? Utils.buildTrendTop3Html(trendData) : "";
 
     const emailBody = `
     <div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.6;max-width:600px;">
       <p style="font-size:16px;font-weight:bold;color:#333;border-bottom:2px solid #eee;padding-bottom:8px;">투자의견이 변경된 종목이 있습니다.</p>
       <div>${changesHtml}</div>
       ${macroContextHtml}
+      ${trendTop3Html}
       <p style="margin:0;"><strong>현재 매수 의견 종목:</strong> ${buyOpinions.length > 0 ? buyOpinions.join(", ") : "없음"}</p>
       <p style="margin:0;"><strong>현재 매도 의견 종목:</strong> ${sellOpinions.length > 0 ? sellOpinions.join(", ") : "없음"}</p><br>
       <p style="color:#888;font-size:12px;">발송 시각 (한국): ${kstDate}<br>발송 시각 (미 동부): ${estString}</p>

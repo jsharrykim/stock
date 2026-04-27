@@ -78,6 +78,8 @@ const CONSTANTS = {
     SELL_HOLD_HOURS:   48,
     REENTRY_DAYS:      10,
     REENTRY_DROP:      0.03,
+    // 전략 공통 상단 과열 매수 차단
+    NASDAQ_BUY_BLOCK_MAX: 9,
     // 나스닥 하락장 필터 (A/C/D/E/F에 적용 | B그룹은 미적용)
     NASDAQ_DIST_UPPER:   -3,    // 데스존 상한: 이 미만이면 차단 시작
     NASDAQ_DIST_LOWER:   -12,   // 찐바닥: 이 이하이면 E/F 차단 해제 + 래치 OFF
@@ -207,7 +209,7 @@ function updateInvestmentOpinion() {
 
   const marketData = {
     ...globalData, ...timeData,
-    nasdaqPeakAlert: allProperties["NasdaqPeakSellState"] === "TRUE",
+    nasdaqPeakAlert: globalData.nasdaqPeakAlert,
     ixicFilterActive
   };
   console.log(
@@ -243,8 +245,11 @@ function loadGlobalData(targetSheet) {
   const ixicPrice = Number(targetSheet.getRange("W1").getValue()) || 0;
   const ixicMa200 = Number(targetSheet.getRange("AE1").getValue()) || 0;
   const ixicDist  = (ixicPrice > 0 && ixicMa200 > 0) ? (ixicPrice / ixicMa200 - 1) * 100 : 100;
+  const peakState = typeof getNasdaqPeakSignalState_ === "function"
+    ? getNasdaqPeakSignalState_(targetSheet, PropertiesService.getScriptProperties().getProperties())
+    : { nasdaqPeakAlert: false };
   console.log(`[글로벌 로드] 이벤트: "${event}", VIX: ${vixD}, IXIC: ${ixicPrice}, IXIC MA200: ${ixicMa200}, 이격도: ${ixicDist.toFixed(2)}%`);
-  return { event, vixD, ixicDist };
+  return { event, vixD, ixicDist, nasdaqPeakAlert: peakState.nasdaqPeakAlert };
 }
 
 function loadStockData(targetSheet) {
@@ -507,12 +512,13 @@ function clearExitReason(stockName) {
 function evaluateBuyCondition(ind, vixD, ixicDist, ixicFilterActive, isHolding = false, holdingStrategyType = null, allProperties = null) {
   const S            = CONSTANTS.STRATEGY;
   const vixThreshold = isHolding ? S.VIX_RELEASE : S.VIX_MIN;
+  const nasdaqBelowBuyBlock = Number.isFinite(ixicDist) && ixicDist <= S.NASDAQ_BUY_BLOCK_MAX;
 
   // 나스닥 필터 구분
   // strictMomentum (A, C, D): 강세장 전용 — 찐바닥 예외 없음, 이격도 ≥ -3% 필수
-  const nasdaqAllowsStrictMomentum = !ixicFilterActive && ixicDist >= S.NASDAQ_DIST_UPPER;
-  // bottomBuy (E, F): 찐바닥(≤ -12%)도 허용
-  const nasdaqAllowsBottomBuy = !ixicFilterActive;
+  const nasdaqAllowsStrictMomentum = nasdaqBelowBuyBlock && !ixicFilterActive && ixicDist >= S.NASDAQ_DIST_UPPER;
+  // bottomBuy (E, F): 찐바닥(≤ -12%)도 허용, 단 신규 진입은 9% 초과 시 차단
+  const nasdaqAllowsBottomBuy = nasdaqBelowBuyBlock && !ixicFilterActive;
 
   // ── A그룹: MA200 위 + MACD 골든크로스 + 종가%B > 80 + RSI > 70 ───────────
   const aCond1 = ind.currentPrice > ind.ma200;
@@ -537,7 +543,7 @@ function evaluateBuyCondition(ind, vixD, ixicDist, ixicFilterActive, isHolding =
   const bCond4 = lrSlope > 0;
   const bCond5 = ind.lrTrendline !== null && ind.lrTrendline > 0
               && ind.candleLow  !== null && ind.candleLow <= ind.lrTrendline * S.LR_TOUCH_RATIO;
-  const entryGroupB = bCond1 && bCond2 && bCond3 && bCond4 && bCond5;
+  const entryGroupB = bCond1 && bCond2 && bCond3 && bCond4 && bCond5 && nasdaqBelowBuyBlock;
 
   // ── C그룹: MA200 위 + 전일 BB스퀴즈 + 당일 확장 + 거래량 폭발 ───────────
   const bbPairOk = ind.bbWidth !== null && ind.bbWidthAvg60 !== null && ind.bbWidthAvg60 > 0;
@@ -584,26 +590,26 @@ function evaluateBuyCondition(ind, vixD, ixicDist, ixicFilterActive, isHolding =
   let triggered = entryTriggered;
   if (isHolding && holdingStrategyType) {
     if (holdingStrategyType === "A") {
-      // MA200 위 + MACD hist > 0 유지 + 나스닥 필터
+      // MA200 위 + MACD hist > 0 유지 + 나스닥 필터 (상단 과열 포함)
       const macdOk = ind.macdHist !== null && ind.macdHist > 0;
-      triggered = aCond1 && nasdaqAllowsStrictMomentum && macdOk;
+      triggered = aCond1 && !ixicFilterActive && nasdaqBelowBuyBlock && ixicDist >= S.NASDAQ_DIST_UPPER && macdOk;
     } else if (holdingStrategyType === "B") {
-      // bCond5(추세선 터치)는 진입 전용 — 보유 중에는 제외
-      triggered = bCond1 && bCond2 && bCond3Hold && bCond4;
+      // bCond5(추세선 터치)는 진입 전용 — 보유 중에는 제외. 상단 과열 시 관망 전환
+      triggered = bCond1 && bCond2 && bCond3Hold && bCond4 && nasdaqBelowBuyBlock;
     } else if (holdingStrategyType === "C") {
       // MA200 위 + MACD hist > 0 (돌파는 일회성 이벤트 — 이후 모멘텀 유지 확인)
       const macdOkC = ind.macdHist !== null && ind.macdHist > 0;
-      triggered = cCond1 && nasdaqAllowsStrictMomentum && macdOkC;
+      triggered = cCond1 && !ixicFilterActive && nasdaqBelowBuyBlock && ixicDist >= S.NASDAQ_DIST_UPPER && macdOkC;
     } else if (holdingStrategyType === "D") {
-      // MA200 위 + +DI>-DI + MACD>0 + 나스닥 필터
+      // MA200 위 + +DI>-DI + MACD>0 + 나스닥 필터 (상단 과열 포함)
       const diOk   = ind.plusDI !== null && ind.minusDI !== null && ind.plusDI > ind.minusDI;
       const macdOkD = ind.macdHist !== null && ind.macdHist > 0;
-      triggered = dCond1 && nasdaqAllowsStrictMomentum && diOk && macdOkD;
+      triggered = dCond1 && !ixicFilterActive && nasdaqBelowBuyBlock && ixicDist >= S.NASDAQ_DIST_UPPER && diOk && macdOkD;
     } else if (holdingStrategyType === "E") {
-      triggered = eCond1 && nasdaqAllowsBottomBuy
+      triggered = eCond1 && !ixicFilterActive && nasdaqBelowBuyBlock
                && bbPairOk && ind.pctBLow !== null && eCond2 && eCond3;
     } else if (holdingStrategyType === "F") {
-      triggered = fCond1 && nasdaqAllowsBottomBuy
+      triggered = fCond1 && !ixicFilterActive && nasdaqBelowBuyBlock
                && ind.pctBLow !== null && fCond2;
     }
   }
@@ -627,7 +633,7 @@ function evaluateBuyCondition(ind, vixD, ixicDist, ixicFilterActive, isHolding =
     // F그룹
     fCond1, fCond2,
     // 나스닥 필터
-    nasdaqAllowsStrictMomentum, nasdaqAllowsBottomBuy, ixicDist, ixicFilterActive,
+    nasdaqAllowsStrictMomentum, nasdaqAllowsBottomBuy, nasdaqBelowBuyBlock, ixicDist, ixicFilterActive,
     entryTriggered,
     // 레거시 alias (B그룹 로그에서 참조)
     cond2: bCond2, cond3: bCond3, cond3Hold: bCond3Hold,
@@ -732,6 +738,9 @@ function processStocks(stockData, marketData, targetSheet, allProperties, outerS
       (rawDeath ? ` (데스존 ${S.NASDAQ_DIST_UPPER}% ~ ${S.NASDAQ_DIST_LOWER}%)` : ` (히스테리시스 유지, 해제 ≥ ${S.NASDAQ_DIST_RELEASE}%)`)
     );
   }
+  if (Number.isFinite(ixicDist) && ixicDist > S.NASDAQ_BUY_BLOCK_MAX) {
+    console.log(`[나스닥 상단 매수 차단] IXIC 이격도 ${ixicDist.toFixed(2)}% > ${S.NASDAQ_BUY_BLOCK_MAX}% — 전략 공통 신규/재진입 차단`);
+  }
 
   for (let i = 0; i < stockData.length; i++) {
     if (Date.now() - processStartTime > TIMEOUT_GUARD_MS) {
@@ -820,6 +829,24 @@ function processStocks(stockData, marketData, targetSheet, allProperties, outerS
     let newOpinion    = ind.opinion;
     let newEntryPrice = ind.entryPrice;
     let newEntryDate  = ind.entryDate;
+    const liquidateAllHoldings = (reason) => {
+      newOpinion = "매도";
+      newEntryPrice = 0;
+      newEntryDate = null;
+      if (typeof Utils !== "undefined" && typeof Utils.clearAllSlotStateForStock === "function") {
+        Utils.clearAllSlotStateForStock(
+          ind.stockName,
+          ind.currentPrice,
+          Utilities.formatDate(now, "Asia/Seoul", "yyyy-MM-dd"),
+          props,
+          allProperties
+        );
+      }
+      clearEntryInfo(ind.stockName);
+      saveSellInfo(ind.stockName, now, ind.currentPrice);
+      saveExitReason(ind.stockName, reason);
+      entryStrategyWrites[i + 3] = "";  // BC열 초기화
+    };
     const promoteSlotToPrimary = () => {
       const promotedSlot = pickLatestSlot(activeSlots);
       if (!promotedSlot) return false;
@@ -851,9 +878,7 @@ function processStocks(stockData, marketData, targetSheet, allProperties, outerS
       if (isHolding) {
         if (exit.shouldExit) {
           if (!promoteSlotToPrimary()) {
-            newOpinion = "매도"; newEntryPrice = 0; newEntryDate = null;
-            clearEntryInfo(ind.stockName); saveSellInfo(ind.stockName, now, ind.currentPrice); saveExitReason(ind.stockName, exit.reason);
-            entryStrategyWrites[i + 3] = "";  // BC열 초기화
+            liquidateAllHoldings(exit.reason);
             console.log(` → [매도] ${ind.displayName}: ${exit.reason}`);
           } else {
             console.log(` → [부분 매도] ${ind.displayName}: ${exit.reason}`);
@@ -889,10 +914,11 @@ function processStocks(stockData, marketData, targetSheet, allProperties, outerS
       }
     } else if (isHolding) {
       if (exit.shouldExit) {
-        if (!promoteSlotToPrimary()) {
-          newOpinion = "매도"; newEntryPrice = 0; newEntryDate = null;
-          clearEntryInfo(ind.stockName); saveSellInfo(ind.stockName, now, ind.currentPrice); saveExitReason(ind.stockName, exit.reason);
-          entryStrategyWrites[i + 3] = "";  // BC열 초기화
+        if (nasdaqPeakAlert) {
+          liquidateAllHoldings(exit.reason);
+          console.log(` → [전량 청산] ${ind.displayName}: ${exit.reason} (PRIMARY + 슬롯 전체 청산)`);
+        } else if (!promoteSlotToPrimary()) {
+          liquidateAllHoldings(exit.reason);
           console.log(` → [매도] ${ind.displayName}: ${exit.reason}`);
         } else {
           console.log(` → [부분 매도] ${ind.displayName}: ${exit.reason}`);
@@ -986,6 +1012,7 @@ function processStocks(stockData, marketData, targetSheet, allProperties, outerS
       } else {
         if (nasdaqPeakAlert) { console.log(` → [진입 차단] ${ind.displayName}: 나스닥 고점 경고 중 신규/재진입 차단`); }
         else if (isEventWatch) { console.log(` → [이벤트 관망] ${ind.displayName}: 신규 진입 차단 (이벤트: ${marketData.event})`); }
+        else if (ixicDist > S.NASDAQ_BUY_BLOCK_MAX && !buy.triggered) { console.log(` → [상단 과열 차단] ${ind.displayName}: IXIC 이격도 ${ixicDist.toFixed(1)}% > ${S.NASDAQ_BUY_BLOCK_MAX}% — 전략 공통 신규/재진입 차단`); }
         else if (buy.ixicFilterActive && !buy.triggered) { console.log(` → [나스닥 필터 차단] ${ind.displayName}: IXIC 이격도 ${ixicDist.toFixed(1)}% — A/C/D/E/F그룹 차단, B 조건 미충족`); }
         else if (buy.triggered) {
           if (isReentryAllowed) {
@@ -1087,6 +1114,10 @@ function _buildChangeReasonBuy(stratType, ind, vixD) {
 function _buildReleaseReason(stratType, ind, buy, vixD, ixicDist, S) {
   const fP = v => fmtPrice(v, ind.stockName);
   const fn = (v, d) => fmtNumOrDash(v, d);
+  // 상단 과열 — 전 그룹 공통 우선 체크
+  if (Number.isFinite(ixicDist) && ixicDist > S.NASDAQ_BUY_BLOCK_MAX) {
+    return `나스닥 상단 과열 (IXIC 이격도 ${ixicDist.toFixed(1)}% > ${S.NASDAQ_BUY_BLOCK_MAX}%) — 과열 해소 시 자동 복원`;
+  }
   switch (stratType) {
     case "A":
       if (!buy.aCond1) return `200일선 하방 이탈 (현재가 ${fP(ind.currentPrice)} / MA200 ${fP(ind.ma200)})`;
