@@ -1074,9 +1074,9 @@ function _buildChangeReasonBuy(stratType, ind, vixD) {
 function _buildReleaseReason(stratType, ind, buy, vixD, ixicDist, S) {
   const fP = v => fmtPrice(v, ind.stockName);
   const fn = (v, d) => fmtNumOrDash(v, d);
-  // 상단 매수 차단 — 전 그룹 공통 신규/재진입 차단이며 청산 기준은 아니다.
+  // 보유 중인 종목은 상단 과열 구간에서 매수 조건 이탈로 관망 전환하되, 청산 기준은 아니다.
   if (Number.isFinite(ixicDist) && ixicDist > S.NASDAQ_BUY_BLOCK_MAX) {
-    return `나스닥 상단 매수 차단 (QQQ 이격도 ${ixicDist.toFixed(1)}% > ${S.NASDAQ_BUY_BLOCK_MAX}%, 청산 아님) — 과열 해소 시 자동 복원`;
+    return `나스닥 상단 과열 (QQQ 이격도 ${ixicDist.toFixed(1)}% > ${S.NASDAQ_BUY_BLOCK_MAX}%)`;
   }
   switch (stratType) {
     case "A":

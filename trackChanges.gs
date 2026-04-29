@@ -28,7 +28,7 @@ function trackChanges() {
   const trendData     = Utils.getLatestTrendData(targetSheet);
   const industryMap   = Utils.buildIndustryMap(targetSheet);
 
-  const { changes, buyOpinions, sellOpinions, updatedOpinions } = processData(
+  const { changes, buyOpinions, watchHoldingOpinions, sellOpinions, updatedOpinions } = processData(
     currentData, currentGlobalData, lastValues.event, currentValidOpinions,
     { kstDate: kstDateOnly, kstHour, kstMinute, now }, allProperties, props
   );
@@ -38,9 +38,9 @@ function trackChanges() {
     c.trendBadge = (c.to === "매수" && c.industry && trendData) ? Utils.buildTrendBadge(c.industry, trendData) : null;
   });
 
-  console.log(`[분석 완료] 변경: ${changes.length}건, 현재 매수 의견: ${buyOpinions.length}개(${buyOpinions.length > 0 ? buyOpinions.join(", ") : "없음"}), 현재 매도 의견: ${sellOpinions.length}개(${sellOpinions.length > 0 ? sellOpinions.join(", ") : "없음"})`);
+  console.log(`[분석 완료] 변경: ${changes.length}건, 현재 매수 의견: ${buyOpinions.length}개(${buyOpinions.length > 0 ? buyOpinions.join(", ") : "없음"}), 보유 중 관망: ${watchHoldingOpinions.length}개(${watchHoldingOpinions.length > 0 ? watchHoldingOpinions.join(", ") : "없음"}), 현재 매도 의견: ${sellOpinions.length}개(${sellOpinions.length > 0 ? sellOpinions.join(", ") : "없음"})`);
   if (changes.length > 0) {
-    const emailSent = Utils.sendEmailAlert(targetSheet.getRange("F1").getValue(), changes, buyOpinions, sellOpinions, kstDate, estString, currentGlobalData, trendData);
+    const emailSent = Utils.sendEmailAlert(targetSheet.getRange("F1").getValue(), changes, buyOpinions, watchHoldingOpinions, sellOpinions, kstDate, estString, currentGlobalData, trendData);
     if (!emailSent) {
       console.log("[이메일 미발송] lastValues 저장 보류 — 다음 실행에서 동일 변경 재시도");
       throw new Error("투자의견 변경 이메일 발송 실패");
@@ -56,6 +56,7 @@ function processData(currentData, currentGlobalData, lastEvent, currentValidOpin
   const { kstDate, now } = timeDetails;
   const changes          = [];
   const buyOpinions      = [];
+  const watchHoldingOpinions = [];
   const sellOpinions     = [];
   const updatedOpinions  = { ...currentValidOpinions };
 
@@ -67,6 +68,7 @@ function processData(currentData, currentGlobalData, lastEvent, currentValidOpin
     const currentOpinion = String(row[C.opinion]).trim();
     const displayName    = Utils.getDisplayName(stockName, row);
     if (currentOpinion === "매수") buyOpinions.push(displayName);
+    if (currentOpinion === "관망" && Utils.loadEntryInfoFrom(stockName, allProperties).price > 0) watchHoldingOpinions.push(displayName);
     if (currentOpinion === "매도") sellOpinions.push(displayName);
 
     if (!Utils.toNum(row[C.currentPrice]) || !Utils.toNum(row[C.ma200])) { console.log(`[SKIP] ${displayName} — 데이터 오류`); return; }
@@ -85,7 +87,7 @@ function processData(currentData, currentGlobalData, lastEvent, currentValidOpin
     processMultiSlots(stockName, row, currentGlobalData, now, allProperties, kstDate, changes, props);
   });
 
-  return { changes, buyOpinions, sellOpinions, updatedOpinions };
+  return { changes, buyOpinions, watchHoldingOpinions, sellOpinions, updatedOpinions };
 }
 
 function processMultiSlots(stockName, row, globalData, now, allProperties, kstDate, changes, props) {
@@ -1283,12 +1285,12 @@ const Utils = {
 
     const buildBuyReason = (type) => {
       const sqRatio = bbPairOk ? ((bbWidth / bbWidthAvg60) * 100).toFixed(1) + "%" : "-";
-      if (type === "A") return `200일선 상방 & 모멘텀 재가속 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)} | 종가 %B ${pctB !== null ? fmt(pctB) : "-"} | RSI ${Utils.fmtNumOrDash(rsi, 2)} | MACD Hist ${Utils.fmtNumOrDash(macdHist, 4)}`;
-      if (type === "B") return `200일선 하방 & 공황 저점 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)} | VIX ${fmt(vixToday)} | RSI ${Utils.fmtNumOrDash(rsi, 2)} / CCI ${Utils.fmtNumOrDash(cci, 2)} | LR추세선 ${lrTrendline !== null ? fmtP(lrTrendline) : "-"} / 저가 ${candleLow !== null ? fmtP(candleLow) : "-"}`;
-      if (type === "C") return `200일선 상방 & 스퀴즈 거래량 돌파 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)} | BB폭 ${bbWidth !== null ? fmt(bbWidth) : "-"} (전일 ${bbWidthD1 !== null ? fmt(bbWidthD1) : "-"} / 60일 ${bbWidthAvg60 !== null ? fmt(bbWidthAvg60) : "-"}) | 거래량비 ${volRatio !== null ? fmt(volRatio) : "-"} | 종가 %B ${pctB !== null ? fmt(pctB) : "-"} | MACD Hist ${Utils.fmtNumOrDash(macdHist, 4)}`;
-      if (type === "D") return `200일선 상방 & 상승 흐름 강화 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)} | +DI ${plusDI !== null ? fmt(plusDI) : "-"} / -DI ${minusDI !== null ? fmt(minusDI) : "-"} | ADX ${adx !== null ? fmt(adx) : "-"} | 종가 %B ${pctB !== null ? fmt(pctB) : "-"} | MACD Hist ${Utils.fmtNumOrDash(macdHist, 4)}`;
-      if (type === "E") return `200일선 상방 & 스퀴즈 저점 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)} | BB폭 ${bbWidth !== null ? fmt(bbWidth) : "-"} / 60일평균 ${bbWidthAvg60 !== null ? fmt(bbWidthAvg60) : "-"} (압축 ${sqRatio}) | 저가 %B ${pctBLow !== null ? fmt(pctBLow) : "-"}`;
-      if (type === "F") return `200일선 상방 & BB 극단 저점 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)} | 저가 %B ${pctBLow !== null ? fmt(pctBLow) : "-"}`;
+      if (type === "A") return `A. 200일선 상방 & 모멘텀 재가속 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)} | 종가 %B ${pctB !== null ? fmt(pctB) : "-"} | RSI ${Utils.fmtNumOrDash(rsi, 2)} | MACD Hist ${Utils.fmtNumOrDash(macdHist, 4)}`;
+      if (type === "B") return `B. 200일선 하방 & 공황 저점 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)} | VIX ${fmt(vixToday)} | RSI ${Utils.fmtNumOrDash(rsi, 2)} / CCI ${Utils.fmtNumOrDash(cci, 2)} | LR추세선 ${lrTrendline !== null ? fmtP(lrTrendline) : "-"} / 저가 ${candleLow !== null ? fmtP(candleLow) : "-"}`;
+      if (type === "C") return `C. 200일선 상방 & 스퀴즈 거래량 돌파 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)} | BB폭 ${bbWidth !== null ? fmt(bbWidth) : "-"} (전일 ${bbWidthD1 !== null ? fmt(bbWidthD1) : "-"} / 60일 ${bbWidthAvg60 !== null ? fmt(bbWidthAvg60) : "-"}) | 거래량비 ${volRatio !== null ? fmt(volRatio) : "-"} | 종가 %B ${pctB !== null ? fmt(pctB) : "-"} | MACD Hist ${Utils.fmtNumOrDash(macdHist, 4)}`;
+      if (type === "D") return `D. 200일선 상방 & 상승 흐름 강화 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)} | +DI ${plusDI !== null ? fmt(plusDI) : "-"} / -DI ${minusDI !== null ? fmt(minusDI) : "-"} | ADX ${adx !== null ? fmt(adx) : "-"} | 종가 %B ${pctB !== null ? fmt(pctB) : "-"} | MACD Hist ${Utils.fmtNumOrDash(macdHist, 4)}`;
+      if (type === "E") return `E. 200일선 상방 & 스퀴즈 저점 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)} | BB폭 ${bbWidth !== null ? fmt(bbWidth) : "-"} / 60일평균 ${bbWidthAvg60 !== null ? fmt(bbWidthAvg60) : "-"} (압축 ${sqRatio}) | 저가 %B ${pctBLow !== null ? fmt(pctBLow) : "-"}`;
+      if (type === "F") return `F. 200일선 상방 & BB 극단 저점 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)} | 저가 %B ${pctBLow !== null ? fmt(pctBLow) : "-"}`;
       return currentPrice !== null && ma200 !== null && currentPrice > ma200
         ? `200일선 상방 진입 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)}`
         : `200일선 하방 진입 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)}`;
@@ -1315,7 +1317,7 @@ const Utils = {
         let releaseDetail;
 
         if (Number.isFinite(ixicDist) && ixicDist > S.NASDAQ_BUY_BLOCK_MAX) {
-          releaseDetail = `나스닥 상단 매수 차단 (QQQ 이격도 ${ixicDist.toFixed(1)}% > ${S.NASDAQ_BUY_BLOCK_MAX}%, 청산 아님) — 과열 해소 시 자동 복원`;
+          releaseDetail = `나스닥 상단 과열 (QQQ 이격도 ${ixicDist.toFixed(1)}% > ${S.NASDAQ_BUY_BLOCK_MAX}%)`;
         } else if ((stratType === "E" || stratType === "F") && ixicFilterActive) {
           releaseDetail = rawDeath
             ? `나스닥 하락장 필터 진입 (QQQ 이격도 ${ixicDist.toFixed(1)}% → 데스존 ${S.NASDAQ_DIST_UPPER}% ~ ${S.NASDAQ_DIST_LOWER}%)`
@@ -1390,7 +1392,7 @@ const Utils = {
             ? `BB 하단 눌림 해소 (저가 %B ${Utils.fmtNumOrDash(pctBLow, 2)} > ${S.BB_PCT_B_LOW_MAX})`
             : `저가 %B 일시 결측 (눌림 해소로 단정하지 않음)`;
         }
-        return `매수 조건 해제 — ${releaseDetail} (보유 중 계속 추적)`;
+        return `매수 조건 해제 — ${releaseDetail} (보유 포지션 유지, 매도 조건 계속 추적)`;
       }
       if (fromOpinion === "매도") {
         if (currentGlobalData.nasdaqPeakAlert) {
@@ -1839,25 +1841,25 @@ const Utils = {
     const fmt          = (v, d) => v !== null ? Number(v).toFixed(d) : "-";
 
     if (strategy === "A") {
-      return `모멘텀 재가속 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)} | 종가 %B ${fmt(pctB, 2)} | RSI ${fmt(rsi, 1)} | MACD hist ${fmt(macdHist, 4)}`;
+      return `A. 200일선 상방 & 모멘텀 재가속 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)} | 종가 %B ${fmt(pctB, 2)} | RSI ${fmt(rsi, 1)} | MACD hist ${fmt(macdHist, 4)}`;
     }
     if (strategy === "B") {
-      return `공황 저점 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)} | VIX ${globalData.vixToday !== undefined ? globalData.vixToday.toFixed(2) : "-"} | RSI ${fmt(rsi, 1)} / CCI ${fmt(cci, 1)} | LR추세선 ${fmtP(lrTrendline)} / 저가 ${fmtP(candleLow)}`;
+      return `B. 200일선 하방 & 공황 저점 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)} | VIX ${globalData.vixToday !== undefined ? globalData.vixToday.toFixed(2) : "-"} | RSI ${fmt(rsi, 1)} / CCI ${fmt(cci, 1)} | LR추세선 ${fmtP(lrTrendline)} / 저가 ${fmtP(candleLow)}`;
     }
     if (strategy === "C") {
       const sqRatio = (bbWidthD1 !== null && bbWidthAvg60 !== null && bbWidthAvg60 > 0)
         ? ((bbWidthD1 / bbWidthAvg60) * 100).toFixed(1) + "%" : "-";
-      return `스퀴즈 거래량 돌파 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)} | BB폭 ${fmt(bbWidth, 2)} (전일 ${fmt(bbWidthD1, 2)} / 60일 ${fmt(bbWidthAvg60, 2)}) | 거래량비 ${fmt(volRatio, 2)} | 종가 %B ${fmt(pctB, 2)}`;
+      return `C. 200일선 상방 & 스퀴즈 거래량 돌파 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)} | BB폭 ${fmt(bbWidth, 2)} (전일 ${fmt(bbWidthD1, 2)} / 60일 ${fmt(bbWidthAvg60, 2)}) | 거래량비 ${fmt(volRatio, 2)} | 종가 %B ${fmt(pctB, 2)}`;
     }
     if (strategy === "D") {
-      return `상승 흐름 강화 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)} | +DI ${fmt(plusDI, 2)} / -DI ${fmt(minusDI, 2)} | ADX ${fmt(adx, 2)} | 종가 %B ${fmt(pctB, 2)} | MACD hist ${fmt(macdHist, 4)}`;
+      return `D. 200일선 상방 & 상승 흐름 강화 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)} | +DI ${fmt(plusDI, 2)} / -DI ${fmt(minusDI, 2)} | ADX ${fmt(adx, 2)} | 종가 %B ${fmt(pctB, 2)} | MACD hist ${fmt(macdHist, 4)}`;
     }
     if (strategy === "E") {
       const sqRatio = (bbWidth !== null && bbWidthAvg60 !== null && bbWidthAvg60 > 0)
         ? ((bbWidth / bbWidthAvg60) * 100).toFixed(1) + "%" : "-";
-      return `스퀴즈 저점 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)} | BB폭 압축 ${sqRatio} | 저가 %B ${fmt(pctBLow, 2)}`;
+      return `E. 200일선 상방 & 스퀴즈 저점 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)} | BB폭 압축 ${sqRatio} | 저가 %B ${fmt(pctBLow, 2)}`;
     }
-    return `BB 극단 저점 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)} | 저가 %B ${fmt(pctBLow, 2)}`;
+    return `F. 200일선 상방 & BB 극단 저점 — 현재가 ${fmtP(currentPrice)} / MA200 ${fmtP(ma200)} | 저가 %B ${fmt(pctBLow, 2)}`;
   },
 
   recordBuySignal(stockName, buyDate, buyPrice, strategyLabel) {
@@ -1902,7 +1904,7 @@ const Utils = {
     if (updateCount === 0) console.log(`[로깅 건너띔] ${stockName}: 청산할 매수 기록 없음`);
   },
 
-  sendEmailAlert(recipientEmail, changes, buyOpinions, sellOpinions, kstDate, estString, globalData, trendData = null) {
+  sendEmailAlert(recipientEmail, changes, buyOpinions, watchHoldingOpinions, sellOpinions, kstDate, estString, globalData, trendData = null) {
     const stockSymbols = changes.map(c => c.ticker).join(", ");
     const hasBuyTransition = changes.some(c => c.to === "매수" && c.from !== "매수");
     const changesHtml  = changes.map((c, i) => {
@@ -1939,6 +1941,7 @@ const Utils = {
       ${macroContextHtml}
       ${trendTop3Html}
       <p style="margin:0;"><strong>현재 매수 의견 종목:</strong> ${buyOpinions.length > 0 ? buyOpinions.join(", ") : "없음"}</p>
+      <p style="margin:0;"><strong>보유 중 관망 종목:</strong> ${watchHoldingOpinions.length > 0 ? watchHoldingOpinions.join(", ") : "없음"}</p>
       <p style="margin:0;"><strong>현재 매도 의견 종목:</strong> ${sellOpinions.length > 0 ? sellOpinions.join(", ") : "없음"}</p><br>
       <p style="color:#888;font-size:12px;">발송 시각 (한국): ${kstDate}<br>발송 시각 (미 동부): ${estString}</p>
     </div>`;
