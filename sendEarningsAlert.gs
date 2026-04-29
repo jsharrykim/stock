@@ -64,7 +64,7 @@ function _earningsGetFromSheet(targetSheet) {
   return results;
 }
 
-// 글로벌 데이터 (VIX, IXIC 이격도)
+// 글로벌 데이터 (VIX, QQQ 이격도)
 function _earningsGetGlobalData(targetSheet) {
   const vix       = Number(targetSheet.getRange("O1").getValue()) || 0;
   const ixicPrice = Number(targetSheet.getRange("W1").getValue()) || 0;
@@ -166,7 +166,7 @@ function _earningsBuildEmailBody(stocks, trendData, globalData, kstDate, estDate
     `<div style="margin-bottom:16px;padding:8px 12px;background:#f0f7ff;border-left:3px solid #3498db;font-size:13px;color:#333;">` +
     `이번 주 주도 섹터: ${topSectors}` +
     `&nbsp;|&nbsp; VIX <strong>${globalData.vix.toFixed(1)}</strong>` +
-    `&nbsp;|&nbsp; IXIC 이격도 <strong>${ixicDistStr}</strong>` +
+    `&nbsp;|&nbsp; QQQ 이격도 <strong>${ixicDistStr}</strong>` +
     `</div>`;
 
   const cardsHtml = stocks.map(s => {

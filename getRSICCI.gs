@@ -86,7 +86,7 @@ function batchPrefetchPrices() {
   // ⑤ 신규/갱신 결과를 한 번에 저장 (종목당 setProperty → setProperties 1회)
   if (Object.keys(propsToSave).length > 0) {
     try {
-      PropertiesService.getScriptProperties().setProperties(propsToSave, true);
+      PropertiesService.getScriptProperties().setProperties(propsToSave);
     } catch (e) {
       console.log("[batchPrefetch 배치 저장 실패, 개별 저장] " + e.toString());
       Object.keys(propsToSave).forEach(function(k) {
@@ -218,6 +218,62 @@ function getUSRSI(symbol, period) {
   } catch (error) {
     return [["오류 발생: " + error.toString()]];
   }
+}
+
+// ──────────────────────────────────────────────
+// QQQ 고점 판단용 RSI 래퍼
+// ──────────────────────────────────────────────
+function getQQQDailyRSI(period) {
+  period = period || 14;
+  var result = getUSRSI("QQQ", period);
+  return _pickResultValue(result, 0);
+}
+
+function getQQQDailyRSIPrev(period) {
+  period = period || 14;
+  var result = getUSRSI("QQQ", period);
+  return _pickResultValue(result, 1);
+}
+
+function getQQQWeeklyRSI(period) {
+  period = period || 14;
+  try {
+    var data = _fetchUSChartCloses("QQQ", "3y", "1wk", "US_QQQ_" + period + "_1wk");
+    if (!data || data.length < period + 1) return "데이터 부족";
+
+    var rsiValues = _calcRSI(data, period);
+    if (!rsiValues || rsiValues.length < 1) return "데이터 부족";
+
+    return Number(rsiValues[rsiValues.length - 1].toFixed(2));
+  } catch (error) {
+    return "오류 발생: " + error.toString();
+  }
+}
+
+function getQQQPeakRsiValues(period) {
+  period = period || 14;
+  return [[getQQQWeeklyRSI(period), getQQQDailyRSI(period), getQQQDailyRSIPrev(period)]];
+}
+
+function _pickResultValue(result, idx) {
+  if (!result || !result[0] || result[0].length <= idx) return "데이터 부족";
+  return result[0][idx];
+}
+
+function _fetchUSChartCloses(symbol, range, interval, cacheKey) {
+  var url = "https://query1.finance.yahoo.com/v8/finance/chart/" + symbol +
+    "?range=" + range + "&interval=" + interval;
+  var options = { 'muteHttpExceptions': true, 'headers': { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json', 'Cache-Control': 'no-cache' } };
+
+  var text = _fetchAndCache(url, cacheKey, options, false);
+  if (!text) throw new Error("API 통신 오류");
+
+  var data = JSON.parse(text);
+  var prices = (data.chart && data.chart.result && data.chart.result[0] &&
+                data.chart.result[0].indicators && data.chart.result[0].indicators.quote &&
+                data.chart.result[0].indicators.quote[0].close) || [];
+
+  return prices.filter(function(p) { return p !== null && !isNaN(p) && isFinite(p); });
 }
 
 // ──────────────────────────────────────────────

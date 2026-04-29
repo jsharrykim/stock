@@ -28,7 +28,16 @@ function updateAllAndTrackChanges() {
 
     console.log(`[대기] 데이터 반영 대기 30초`);
     Utilities.sleep(30000);
-    console.log(`[대기 완료] 투자의견 업데이트 시작`);
+    console.log(`[대기 완료] 나스닥 고점 상태 점검 시작`);
+
+    // 고점 경고 상태는 같은 실행 안에서 바로 투자의견/매도 판단에 반영되어야 한다.
+    // 기존에는 checkNasdaqMASignals()가 trackChanges() 뒤에 있어, 경고 메일이 와도
+    // 실제 보유 종목 청산이 다음 트리거로 밀리는 순서 버그가 발생할 수 있었다.
+    console.log(`[시작] checkNasdaqMASignals`);
+    checkNasdaqMASignals();
+    console.log(`[완료] checkNasdaqMASignals (${elapsed()})`);
+
+    console.log(`[시작] 투자의견 업데이트 준비`);
 
     // updateInvestmentOpinion 실행 전 현재 시트 상태를 trackChanges 비교 기준으로 저장.
     // batchPrefetchPrices / updateLRTrendlineAll 실행 도중 Properties가 초기화되는 경우에도
@@ -47,10 +56,6 @@ function updateAllAndTrackChanges() {
     console.log(`[시작] trackChanges`);
     trackChanges();
     console.log(`[완료] trackChanges (${elapsed()})`);
-
-    console.log(`[시작] checkNasdaqMASignals`);
-    checkNasdaqMASignals();
-    console.log(`[완료] checkNasdaqMASignals (${elapsed()})`);
 
     setPipelineState_("completed", "done", null);
     console.log(`[트리거 종료] 모든 작업 완료 (총 ${elapsed()})`);

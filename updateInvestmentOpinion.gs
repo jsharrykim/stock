@@ -147,7 +147,7 @@ function ensureHoldRestoreWatchState(stockName, currentPrice, now, allProperties
 
 const NASDAQ_AB_LATCH_KEY = "NasdaqABFilterLatched";
 
-/** IXIC 이격도(%) 기준 하락장 필터 활성 여부 (E/F그룹용 히스테리시스 포함) */
+/** QQQ 이격도(%) 기준 하락장 필터 활성 여부 (E/F그룹용 히스테리시스 포함) */
 function computeNasdaqABFilterActive(ixicDist) {
   const S     = CONSTANTS.STRATEGY;
   const props = PropertiesService.getScriptProperties();
@@ -193,9 +193,12 @@ function updateInvestmentOpinion() {
     nasdaqPeakAlert: globalData.nasdaqPeakAlert,
     ixicFilterActive
   };
+  const buyBlockActive = Number.isFinite(marketData.ixicDist) && marketData.ixicDist > Sg.NASDAQ_BUY_BLOCK_MAX;
   console.log(
-    `[글로벌] 이벤트: "${marketData.event}", VIX: ${marketData.vixD}, IXIC 이격도: ${marketData.ixicDist.toFixed(2)}%, ` +
-    `하락장 필터: ${ixicFilterActive ? "활성" : "비활성"} (데스존 ${Sg.NASDAQ_DIST_LOWER}% ~ ${Sg.NASDAQ_DIST_UPPER}%), 나스닥 고점 경고: ${marketData.nasdaqPeakAlert}`
+    `[글로벌] 이벤트: "${marketData.event}", VIX: ${marketData.vixD}, QQQ 이격도(현재): ${marketData.ixicDist.toFixed(2)}%, ` +
+    `하락장 필터(A/C/D/E/F 차단, 데스존 ${Sg.NASDAQ_DIST_LOWER}%~${Sg.NASDAQ_DIST_UPPER}%): ${ixicFilterActive ? "활성" : "비활성"}, ` +
+    `상단 매수 차단(신규/재진입만, >${Sg.NASDAQ_BUY_BLOCK_MAX}%): ${buyBlockActive ? "활성" : "비활성"}, ` +
+    `고점 청산/강제매도(>${((1.14 - 1) * 100).toFixed(0)}%+RSI): ${marketData.nasdaqPeakAlert ? "활성" : "비활성"}`
   );
   const stockData     = loadStockData(targetSheet);
   console.log(`[로드] 종목 데이터 로드 완료: ${stockData.length}행`);
@@ -229,7 +232,7 @@ function loadGlobalData(targetSheet) {
   const peakState = typeof getNasdaqPeakSignalState_ === "function"
     ? getNasdaqPeakSignalState_(targetSheet, PropertiesService.getScriptProperties().getProperties())
     : { nasdaqPeakAlert: false };
-  console.log(`[글로벌 로드] 이벤트: "${event}", VIX: ${vixD}, IXIC: ${ixicPrice}, IXIC MA200: ${ixicMa200}, 이격도: ${ixicDist.toFixed(2)}%`);
+  console.log(`[글로벌 로드] 이벤트: "${event}", VIX: ${vixD}, QQQ: ${ixicPrice}, QQQ MA200: ${ixicMa200}, QQQ 이격도(현재): ${ixicDist.toFixed(2)}%`);
   return { event, vixD, ixicDist, nasdaqPeakAlert: peakState.nasdaqPeakAlert };
 }
 
@@ -486,7 +489,7 @@ function clearExitReason(stockName) {
  * A: MA200 위 + MACD 골든크로스 + %B>80 + RSI>70          (강세장 전용, 나스닥 ≥ -3%)
  * B: MA200 아래 + VIX≥25 + 과매도 + 추세선 터치            (나스닥 필터 미적용)
  * C: MA200 위 + BB스퀴즈 돌파 + 거래량 폭발 + %B>55        (강세장 전용, 나스닥 ≥ -3%)
- * D: MA200 위 + ADX>30 + +DI>-DI + ADX상승 + MACD>0 + %B 30~75 + IXIC ≤ 13% (강세장 전용, -3% ≤ 나스닥 ≤ 13%)
+ * D: MA200 위 + ADX>30 + +DI>-DI + ADX상승 + MACD>0 + %B 30~75 + QQQ ≤ 13% (강세장 전용, -3% ≤ 나스닥 ≤ 13%)
  * E: MA200 위 + BB스퀴즈 + 저가%B≤50                       (히스테리시스 + 찐바닥 허용)
  * F: MA200 위 + 저가%B≤5                                   (히스테리시스 + 찐바닥 허용)
  */
@@ -603,7 +606,7 @@ function evaluateBuyCondition(ind, vixD, ixicDist, ixicFilterActive, isHolding =
 function evaluateExitCondition(ind, now, nasdaqPeakAlert, strategyType = "A", allProperties = null) {
   const S = CONSTANTS.STRATEGY;
   if (!ind.entryPrice || ind.entryPrice <= 0 || !ind.entryDate) return { shouldExit: false, reason: null };
-  if (nasdaqPeakAlert) return { shouldExit: true, reason: "나스닥 고점 경고 — 강제 매도" };
+  if (nasdaqPeakAlert) return { shouldExit: true, reason: "나스닥 고점 청산/강제매도 — QQQ > MA200×1.14 + RSI65 하락" };
 
   const targetPct = strategyType === "A" ? S.TARGET_PCT_A
                   : strategyType === "B" ? S.TARGET_PCT_B
@@ -686,17 +689,17 @@ function processStocks(stockData, marketData, targetSheet, allProperties, outerS
   const entryDateWrites     = {};
   const entryStrategyWrites = {};
 
-  if (nasdaqPeakAlert) console.log("[나스닥 고점 경고] NasdaqPeakSellState=TRUE — ENTRY_ 키 보유 종목 전체 강제 매도 + 신규/재진입 차단");
+  if (nasdaqPeakAlert) console.log("[나스닥 고점 청산/강제매도] 조건 충족(>14% + 주봉/일봉 RSI≥65 + 일봉 RSI 하락) — ENTRY_ 키 보유 종목 전체 강제 매도 + 신규/재진입 차단");
 
   if (ixicFilterActive) {
     const rawDeath = ixicDist > S.NASDAQ_DIST_LOWER && ixicDist < S.NASDAQ_DIST_UPPER;
     console.log(
-      `[나스닥 하락장 필터] A/C/D/E/F 차단 (B는 미적용) — IXIC 이격도 ${ixicDist.toFixed(2)}%` +
+      `[나스닥 하락장 필터] A/C/D/E/F 차단 (B는 미적용, 청산 아님) — QQQ 이격도 ${ixicDist.toFixed(2)}%` +
       (rawDeath ? ` (데스존 ${S.NASDAQ_DIST_UPPER}% ~ ${S.NASDAQ_DIST_LOWER}%)` : ` (히스테리시스 유지, 해제 ≥ ${S.NASDAQ_DIST_RELEASE}%)`)
     );
   }
   if (Number.isFinite(ixicDist) && ixicDist > S.NASDAQ_BUY_BLOCK_MAX) {
-    console.log(`[나스닥 상단 매수 차단] IXIC 이격도 ${ixicDist.toFixed(2)}% > ${S.NASDAQ_BUY_BLOCK_MAX}% — 전략 공통 신규/재진입 차단`);
+    console.log(`[나스닥 상단 매수 차단] QQQ 이격도 ${ixicDist.toFixed(2)}% > ${S.NASDAQ_BUY_BLOCK_MAX}% — 전략 공통 신규/재진입 차단 (청산 기준 아님)`);
   }
 
   for (let i = 0; i < stockData.length; i++) {
@@ -941,13 +944,13 @@ function processStocks(stockData, marketData, targetSheet, allProperties, outerS
       if (ind.opinion === "매도") {
         if (elapsedHours < S.SELL_HOLD_HOURS) {
           if (nasdaqPeakAlert) {
-            console.log(` → [매도 유지] ${ind.displayName}: 나스닥 고점 경고 + 48시간 대기 중 (${elapsedHours.toFixed(1)}시간 경과)`);
+            console.log(` → [매도 유지] ${ind.displayName}: 고점 청산/강제매도 후 48시간 대기 중 (${elapsedHours.toFixed(1)}시간 경과)`);
           } else {
             console.log(` → [매도 유지] ${ind.displayName}: ${elapsedHours.toFixed(1)}시간 경과 / 48시간 대기 중`);
           }
         } else if (nasdaqPeakAlert) {
           newOpinion = "관망";
-          console.log(` → [매도 → 관망] ${ind.displayName}: 48시간 경과 후에도 나스닥 고점 경고 유지 — 신규/재진입 차단 지속`);
+          console.log(` → [매도 → 관망] ${ind.displayName}: 48시간 경과 후에도 고점 청산/강제매도 상태 유지 — 신규/재진입 차단 지속`);
         } else if (buy.triggered && !isEventWatch) {
           if (isReentryAllowed) {
             newOpinion = "매수"; newEntryPrice = ind.currentPrice; newEntryDate = now;
@@ -967,10 +970,10 @@ function processStocks(stockData, marketData, targetSheet, allProperties, outerS
           }
         }
       } else {
-        if (nasdaqPeakAlert) { console.log(` → [진입 차단] ${ind.displayName}: 나스닥 고점 경고 중 신규/재진입 차단`); }
+        if (nasdaqPeakAlert) { console.log(` → [진입 차단] ${ind.displayName}: 고점 청산/강제매도 상태 — 신규/재진입 차단`); }
         else if (isEventWatch) { console.log(` → [이벤트 관망] ${ind.displayName}: 신규 진입 차단 (이벤트: ${marketData.event})`); }
-        else if (ixicDist > S.NASDAQ_BUY_BLOCK_MAX && !buy.triggered) { console.log(` → [상단 과열 차단] ${ind.displayName}: IXIC 이격도 ${ixicDist.toFixed(1)}% > ${S.NASDAQ_BUY_BLOCK_MAX}% — 전략 공통 신규/재진입 차단`); }
-        else if (buy.ixicFilterActive && !buy.triggered) { console.log(` → [나스닥 필터 차단] ${ind.displayName}: IXIC 이격도 ${ixicDist.toFixed(1)}% — A/C/D/E/F그룹 차단, B 조건 미충족`); }
+        else if (ixicDist > S.NASDAQ_BUY_BLOCK_MAX && !buy.triggered) { console.log(` → [상단 매수 차단] ${ind.displayName}: QQQ 이격도 ${ixicDist.toFixed(1)}% > ${S.NASDAQ_BUY_BLOCK_MAX}% — 신규/재진입 차단만 적용 (청산 아님)`); }
+        else if (buy.ixicFilterActive && !buy.triggered) { console.log(` → [하락장 필터 차단] ${ind.displayName}: QQQ 이격도 ${ixicDist.toFixed(1)}% — A/C/D/E/F그룹 차단, B 조건 미충족 (청산 아님)`); }
         else if (buy.triggered) {
           if (isReentryAllowed) {
             newOpinion = "매수"; newEntryPrice = ind.currentPrice; newEntryDate = now;
@@ -999,7 +1002,7 @@ function processStocks(stockData, marketData, targetSheet, allProperties, outerS
         }
       } else if (newOpinion === "관망" && ind.opinion === "매도") {
         changeReason = nasdaqPeakAlert
-          ? "나스닥 고점 경고 유지 중 48시간 경과 → 관망 전환 (신규/재진입 차단 유지)"
+          ? "고점 청산/강제매도 상태 유지 중 48시간 경과 → 관망 전환 (신규/재진입 차단 유지)"
           : "매도 후 대기 완료 → 관망 전환 (재진입 필터 유지)";
       } else {
         changeReason = isInitializing ? "초기값 설정" : "관망 전환";
@@ -1071,9 +1074,9 @@ function _buildChangeReasonBuy(stratType, ind, vixD) {
 function _buildReleaseReason(stratType, ind, buy, vixD, ixicDist, S) {
   const fP = v => fmtPrice(v, ind.stockName);
   const fn = (v, d) => fmtNumOrDash(v, d);
-  // 상단 과열 — 전 그룹 공통 우선 체크
+  // 상단 매수 차단 — 전 그룹 공통 신규/재진입 차단이며 청산 기준은 아니다.
   if (Number.isFinite(ixicDist) && ixicDist > S.NASDAQ_BUY_BLOCK_MAX) {
-    return `나스닥 상단 과열 (IXIC 이격도 ${ixicDist.toFixed(1)}% > ${S.NASDAQ_BUY_BLOCK_MAX}%) — 과열 해소 시 자동 복원`;
+    return `나스닥 상단 매수 차단 (QQQ 이격도 ${ixicDist.toFixed(1)}% > ${S.NASDAQ_BUY_BLOCK_MAX}%, 청산 아님) — 과열 해소 시 자동 복원`;
   }
   switch (stratType) {
     case "A":
@@ -1102,7 +1105,7 @@ function _buildReleaseReason(stratType, ind, buy, vixD, ixicDist, S) {
       if (!buy.nasdaqAllowsBottomBuy) {
         const inDeath = ixicDist > S.NASDAQ_DIST_LOWER && ixicDist < S.NASDAQ_DIST_UPPER;
         return inDeath
-          ? `나스닥 하락장 필터 진입 (IXIC 이격도 ${ixicDist.toFixed(1)}% → 데스존 ${S.NASDAQ_DIST_UPPER}% ~ ${S.NASDAQ_DIST_LOWER}%)`
+          ? `나스닥 하락장 필터 진입 (QQQ 이격도 ${ixicDist.toFixed(1)}% → 데스존 ${S.NASDAQ_DIST_UPPER}% ~ ${S.NASDAQ_DIST_LOWER}%)`
           : `나스닥 E/F 차단 유지 (히스테리시스 이격도 ${ixicDist.toFixed(1)}%, 해제 ≥ ${S.NASDAQ_DIST_RELEASE}%)`;
       }
       if (!buy.eCond1) return `200일선 하방 이탈 (현재가 ${fP(ind.currentPrice)} / MA200 ${fP(ind.ma200)})`;
@@ -1114,7 +1117,7 @@ function _buildReleaseReason(stratType, ind, buy, vixD, ixicDist, S) {
       if (!buy.nasdaqAllowsBottomBuy) {
         const inDeath = ixicDist > S.NASDAQ_DIST_LOWER && ixicDist < S.NASDAQ_DIST_UPPER;
         return inDeath
-          ? `나스닥 하락장 필터 진입 (IXIC 이격도 ${ixicDist.toFixed(1)}% → 데스존 ${S.NASDAQ_DIST_UPPER}% ~ ${S.NASDAQ_DIST_LOWER}%)`
+          ? `나스닥 하락장 필터 진입 (QQQ 이격도 ${ixicDist.toFixed(1)}% → 데스존 ${S.NASDAQ_DIST_UPPER}% ~ ${S.NASDAQ_DIST_LOWER}%)`
           : `나스닥 F 차단 유지 (히스테리시스 이격도 ${ixicDist.toFixed(1)}%, 해제 ≥ ${S.NASDAQ_DIST_RELEASE}%)`;
       }
       if (!buy.fCond1) return `200일선 하방 이탈 (현재가 ${fP(ind.currentPrice)} / MA200 ${fP(ind.ma200)})`;
@@ -1202,14 +1205,20 @@ function logStockAnalysis(ind, vixD, ixicDist, event, buy, exit, now, isHolding,
   const rawInDeath = ixicDist > S.NASDAQ_DIST_LOWER && ixicDist < S.NASDAQ_DIST_UPPER;
   const ixicFilterLabel = buy.ixicFilterActive
     ? (rawInDeath
-      ? `🚫 A/C/D/E/F 차단 (데스존 ${S.NASDAQ_DIST_UPPER}% ~ ${S.NASDAQ_DIST_LOWER}%)`
-      : `🚫 차단 유지 (히스테리시스 이격도 ${ixicDist.toFixed(2)}%, 해제 ≥ ${S.NASDAQ_DIST_RELEASE}%)`)
-    : ixicDist <= S.NASDAQ_DIST_LOWER ? `✅ 허용 (찐바닥 ≤ ${S.NASDAQ_DIST_LOWER}%)` : `✅ 허용 (이격도 ≥ ${S.NASDAQ_DIST_RELEASE}%)`;
+      ? `🚫 활성: A/C/D/E/F 차단, B 미적용 (데스존 ${S.NASDAQ_DIST_UPPER}% ~ ${S.NASDAQ_DIST_LOWER}%)`
+      : `🚫 활성 유지: A/C/D/E/F 차단, B 미적용 (히스테리시스, 해제 ≥ ${S.NASDAQ_DIST_RELEASE}%)`)
+    : ixicDist <= S.NASDAQ_DIST_LOWER ? `✅ 비활성: 찐바닥 구간(≤ ${S.NASDAQ_DIST_LOWER}%)` : `✅ 비활성: 강세/정상 구간(≥ ${S.NASDAQ_DIST_RELEASE}%)`;
+  const buyBlockLabel = Number.isFinite(ixicDist) && ixicDist > S.NASDAQ_BUY_BLOCK_MAX
+    ? `🚫 활성: 신규/재진입 차단 (>${S.NASDAQ_BUY_BLOCK_MAX}%, 청산 아님)`
+    : `✅ 비활성: 신규/재진입 허용 범위(≤ ${S.NASDAQ_BUY_BLOCK_MAX}%)`;
+  const peakExitLabel = nasdaqPeakAlert
+    ? `🚨 활성: 보유 종목 강제매도 + 신규/재진입 차단 (>14% + RSI65 하락)`
+    : "없음";
 
   let reentryState = "";
   if (!isHolding && sellTime) {
     if (nasdaqPeakAlert) {
-      reentryState = `\n  재진입 차단: 나스닥 고점 경고 유지 중`;
+      reentryState = `\n  재진입 차단: 고점 청산/강제매도 상태 유지 중`;
     } else if (daysSinceSell <= S.REENTRY_DAYS) {
       const dropPct  = sellPrice > 0 ? ((ind.currentPrice - sellPrice) / sellPrice * 100).toFixed(1) : 0;
       const isDropOk = sellPrice > 0 && ind.currentPrice <= sellPrice * (1 - S.REENTRY_DROP);
@@ -1222,8 +1231,10 @@ function logStockAnalysis(ind, vixD, ixicDist, event, buy, exit, now, isHolding,
     `\n[시장]` +
     `\n  이벤트: ${event}` +
     `\n  VIX: ${fmt(vixD)} (진입 ≥${S.VIX_MIN} / 해제 <${S.VIX_RELEASE}${isHolding ? " [보유중 적용]" : ""}): ${buy.cond2 ? "✅" : "❌"}` +
-    `\n  나스닥 고점 경고: ${nasdaqPeakAlert ? "🚨 활성" : "없음"}` +
-    `\n  IXIC 이격도: ${ixicDist.toFixed(2)}% → ${ixicFilterLabel}` +
+    `\n  QQQ 이격도(현재): ${ixicDist.toFixed(2)}%` +
+    `\n  하락장 필터(데스존/히스테리시스, A/C/D/E/F 차단): ${ixicFilterLabel}` +
+    `\n  상단 매수 차단(>${S.NASDAQ_BUY_BLOCK_MAX}%, 신규/재진입만): ${buyBlockLabel}` +
+    `\n  고점 청산/강제매도(>14%+RSI): ${peakExitLabel}` +
     `\n  ${isKR ? "한국 장" : "미국 장"} 개장(참고): ${isMarketOpen ? "✅ 개장 중" : "❌ 미개장"}` +
 
     `\n[A그룹: 200일선 상방 & 모멘텀 재가속 (나스닥 ≥${S.NASDAQ_DIST_UPPER}%)]` +
