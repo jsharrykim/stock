@@ -266,6 +266,18 @@
   font-size: 13px;
 }
 
+.section-title-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.section-title-inline > span {
+  color: var(--muted);
+  font-size: 13px;
+}
+
 .toolbar-row {
   display: flex;
   align-items: center;
@@ -435,6 +447,7 @@
   font-size: 11px;
   font-weight: 400;
   line-height: 1.28;
+  margin-right: 6px;
   text-align: right;
   white-space: nowrap;
 }
@@ -449,6 +462,11 @@
 .remove-selected-button:hover {
   border-color: rgba(239, 68, 68, 0.36);
   background: #fee2e2;
+}
+
+.reserved-action-button {
+  pointer-events: none;
+  visibility: hidden;
 }
 
 .strategy-filter button.active {

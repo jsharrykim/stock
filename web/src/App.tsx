@@ -741,10 +741,26 @@ function tradeResultLabel(status: TradeStatus) {
   return '보유중'
 }
 
+function tradeCriteriaInfo(strategy: string) {
+  const code = strategyCode(strategy)
+
+  if (['A', 'B', 'C'].includes(code)) {
+    return `${code} 전략 기준: 성공은 매수가 대비 +20% 도달 시 즉시 익절입니다. -30%에 닿으면 손절 실패이고, 60거래일 경과 후 수익 중이거나 120거래일 최대 보유 기간에 걸려 청산되면 수익이어도 목표 미달 실패(익절)로 볼 수 있습니다.`
+  }
+
+  if (code === 'D') {
+    return 'D 전략 기준: 성공은 매수가 대비 +12% 도달 시 즉시 익절입니다. -25%에 닿으면 손절 실패이고, 30거래일 최대 보유 기간 안에 목표를 채우지 못해 청산되면 수익이어도 목표 미달 실패(익절)로 볼 수 있습니다.'
+  }
+
+  if (['E', 'F'].includes(code)) {
+    return `${code} 전략 기준: 성공은 +20% 도달 후 MACD 둔화 신호가 나오거나 목표 도달 후 5거래일 대기 만료 시 청산입니다. -30%에 닿으면 손절 실패이고, 60거래일 수익 중 청산이나 120거래일 최대 보유 기간 청산은 조건 충족 여부에 따라 수익이어도 실패(익절)로 볼 수 있습니다.`
+  }
+
+  return '전략별 성공/실패 기준 정보가 준비 중입니다.'
+}
+
 function tradeResultInfo(trade: TradeLog) {
-  if (trade.status === '익절') return '전략별 목표 수익 또는 청산 조건을 충족해 성공으로 기록된 거래입니다.'
-  if (trade.status === '손절') return '전략별 손절 기준에 도달해 실패로 기록된 거래입니다.'
-  if (trade.status === '실패 익절') return '수익은 났지만 목표 조건을 충족하지 못한 채 최대 보유 기간 등으로 매도되어 실패로 기록된 익절입니다.'
+  if (trade.status !== '보유 중') return tradeCriteriaInfo(trade.strategy)
   return '아직 매도 신호가 없어 성공/실패를 확정하지 않은 보유 중 거래입니다.'
 }
 
@@ -860,6 +876,19 @@ function parseTradeDate(value: string) {
 function holdingPeriodDays(trade: TradeLog) {
   const endTime = trade.status === '보유 중' ? Date.now() : parseTradeDate(trade.sellDate)
   return Math.max(0, Math.ceil((endTime - parseTradeDate(trade.buyDate)) / 86_400_000))
+}
+
+function parsePriceValue(value: string) {
+  const parsed = Number(value.replace(/[^0-9.-]/g, ''))
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+function currentReturnPct(trade: TradeLog) {
+  const buyPrice = parsePriceValue(trade.buyPrice)
+  const currentPrice = parsePriceValue(searchUniverse.find((stock) => stock.ticker === trade.ticker)?.currentPrice ?? '')
+
+  if (!buyPrice || currentPrice === null) return null
+  return ((currentPrice - buyPrice) / buyPrice) * 100
 }
 
 function tradeKey(trade: TradeLog) {
@@ -1353,13 +1382,11 @@ function App() {
         <div className="right-column">
           <section className="panel watchlist-panel">
             <div className="section-heading">
-              <h2>관심 종목</h2>
+              <div className="section-title-inline">
+                <h2>관심 종목</h2>
+                <span>총 {tableStocks.length}개</span>
+              </div>
               <div className="heading-actions">
-                {viewMode === 'personal' && selectedTickers.length > 0 && (
-                  <button className="remove-selected-button" type="button" onClick={removeSelectedStocks}>
-                    제거
-                  </button>
-                )}
                 {viewMode === 'personal' ? (
                   <>
                     {isPersonalWatchlistFull && (
@@ -1369,15 +1396,20 @@ function App() {
                         새 종목을 추가하려면 기존 관심 종목을 제거해 주세요.
                       </span>
                     )}
-                  <button
-                    className={`add-stock-button ${isPersonalWatchlistFull ? 'watchlist-limit-button' : ''}`}
-                    disabled={isPersonalWatchlistFull}
-                    ref={addStockButtonRef}
-                    type="button"
-                    onClick={() => setIsAddingStock((value) => !value)}
-                  >
-                    + 추가
-                  </button>
+                    {selectedTickers.length > 0 && (
+                      <button className="remove-selected-button" type="button" onClick={removeSelectedStocks}>
+                        제거
+                      </button>
+                    )}
+                    <button
+                      className={`add-stock-button ${isPersonalWatchlistFull ? 'watchlist-limit-button' : ''}`}
+                      disabled={isPersonalWatchlistFull}
+                      ref={addStockButtonRef}
+                      type="button"
+                      onClick={() => setIsAddingStock((value) => !value)}
+                    >
+                      + 추가
+                    </button>
                   </>
                 ) : (
                   <button
@@ -1518,14 +1550,24 @@ function App() {
 
           <section className={`panel ${isPersonalWatchlistEmpty ? 'dimmed-panel' : ''}`}>
             <div className="section-heading">
-              <h2>보유중인 종목</h2>
+              <div className="section-title-inline">
+                <h2>보유중인 종목</h2>
+                <span>총 {scopedOpenTrades.length}개</span>
+              </div>
               <div className="heading-actions">
-                {viewMode === 'personal' && selectedHoldingTradeKeys.length > 0 && (
-                  <button className="remove-selected-button" type="button" onClick={() => setIsHoldingDeleteConfirmOpen(true)}>
+                {viewMode === 'personal' && (
+                  <button
+                    aria-hidden={selectedHoldingTradeKeys.length === 0}
+                    className={`remove-selected-button ${selectedHoldingTradeKeys.length === 0 ? 'reserved-action-button' : ''}`}
+                    tabIndex={selectedHoldingTradeKeys.length === 0 ? -1 : 0}
+                    type="button"
+                    onClick={() => {
+                      if (selectedHoldingTradeKeys.length > 0) setIsHoldingDeleteConfirmOpen(true)
+                    }}
+                  >
                     제거
                   </button>
                 )}
-                <span>{scopedOpenTrades.length}개</span>
               </div>
             </div>
 
@@ -1589,7 +1631,13 @@ function App() {
                           strategy={trade.strategy}
                         />
                       </td>
-                      <td className="dash-cell">-</td>
+                      {currentReturnPct(trade) === null ? (
+                        <td className="dash-cell">-</td>
+                      ) : (
+                        <td className={`number-cell ${returnClass(currentReturnPct(trade) ?? 0)}`}>
+                          {(currentReturnPct(trade) ?? 0) >= 0 ? '+' : ''}{(currentReturnPct(trade) ?? 0).toFixed(1)}%
+                        </td>
+                      )}
                       <td>{holdingPeriodDays(trade)}</td>
                     </tr>
                   ))}
