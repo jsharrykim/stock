@@ -1,0 +1,91 @@
+@import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css');
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500;600;700&display=swap');
+
+:root {
+  --text: #3f4b5b;
+  --text-h: #111827;
+  --muted: #6b7280;
+  --bg: #eef2f6;
+  --surface: #ffffff;
+  --card-bg: #ffffff;
+  --input-bg: #ffffff;
+  --subtle: #f4f7fa;
+  --tooltip-bg: #ffffff;
+  --border: #d8e0e8;
+  --accent: #0f766e;
+  --sheet-bg: #ffffff;
+  --sheet-head: #f3f6f9;
+  --sheet-head-text: #111827;
+  --sheet-text: #2f3b4a;
+  --sheet-border: #d7dfe8;
+  --sheet-hover: #f7fafc;
+  --shadow: 0 10px 30px rgba(17, 24, 39, 0.06);
+  --sans:
+    'Pretendard', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  font: 16px/1.55 var(--sans);
+  color: var(--text);
+  background: var(--surface);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --text: #cbd5e1;
+    --text-h: #f8fafc;
+    --muted: #94a3b8;
+    --bg: #08111f;
+    --surface: #101827;
+    --card-bg: #121b2b;
+    --input-bg: #121b2b;
+    --subtle: #1a2638;
+    --tooltip-bg: #101827;
+    --border: #253247;
+    --accent: #2dd4bf;
+    --sheet-bg: #101827;
+    --sheet-head: #151f30;
+    --sheet-head-text: #f8fafc;
+    --sheet-text: #cbd5e1;
+    --sheet-border: #27364c;
+    --sheet-hover: #162235;
+    --shadow: 0 18px 70px rgba(0, 0, 0, 0.32);
+  }
+}
+
+#root {
+  width: min(1680px, 100%);
+  margin: 0 auto;
+  min-height: 100svh;
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--surface);
+}
+
+button,
+input {
+  font-family: inherit;
+}
+
+button {
+  transition:
+    transform 0.18s ease,
+    opacity 0.18s ease,
+    box-shadow 0.18s ease;
+}
+
+button:hover {
+  transform: translateY(-1px);
+}
+
+button:focus-visible,
+input:focus-visible {
+  outline: 3px solid rgba(34, 197, 94, 0.28);
+  outline-offset: 2px;
+}
