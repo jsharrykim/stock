@@ -216,7 +216,7 @@ function updateLRTrendlineAll() {
   // ⑤ 새로 계산된 결과를 한 번에 저장 (종목당 setProperty → setProperties 1회)
   if (Object.keys(propsToSave).length > 0) {
     try {
-      PropertiesService.getScriptProperties().setProperties(propsToSave, true);
+      PropertiesService.getScriptProperties().setProperties(propsToSave);
     } catch (e) {
       console.log("[LR 배치 저장 실패, 개별 저장 시도] " + e.toString());
       Object.keys(propsToSave).forEach(function(k) {
