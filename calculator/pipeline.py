@@ -40,6 +40,8 @@ GROQ_CHAT_COMPLETIONS_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MARKET_TREND_MODEL = "llama-3.3-70b-versatile"
 CNN_FEAR_GREED_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
 FAIR_PRICE_UNAVAILABLE_LABEL = "적자 상태라 판단 불가"
+PRICE_CHECK_REQUIRED_LABEL = "가격 확인 필요"
+MAX_REFRESH_UNIVERSE = int(os.environ.get("MAX_REFRESH_UNIVERSE", "200"))
 
 DEFAULT_UNIVERSE = [
     {"ticker": "005930", "name": "삼성전자", "market": "KR"},
@@ -87,7 +89,7 @@ def read_universe() -> list[dict[str, str]]:
         return DEFAULT_UNIVERSE
     if not isinstance(loaded, list):
         return DEFAULT_UNIVERSE
-    return loaded[:50]
+    return loaded[:MAX_REFRESH_UNIVERSE]
 
 
 def read_search_universe() -> list[dict[str, Any]]:
@@ -267,10 +269,25 @@ def fair_price_range(stock: dict[str, Any], metric: dict[str, str]) -> str:
     return f"{fmt_price(eps * low_multiple, stock['market'])} ~ {fmt_price(eps * high_multiple, stock['market'])}"
 
 
-def valuation_from_price_range(current_price: str, fair_price: str) -> str:
+def price_validation_reason(stock: dict[str, Any], current_price: str, fair_price: str) -> str | None:
     current = parse_amount(current_price)
     parts = [parse_amount(part) for part in fair_price.split("~")]
-    if fair_price == FAIR_PRICE_UNAVAILABLE_LABEL:
+    if current is None or len(parts) != 2 or parts[0] is None or parts[1] is None:
+        return None
+    low, high = parts
+    if low <= 0 or high <= 0:
+        return None
+    # A common sheet failure is ticker collision: a US ticker such as STX can pick up
+    # a Korean stock price, then get formatted as USD. Block absurdly distant values.
+    if current > high * 5 or current < low / 5:
+        return "price_outlier"
+    return None
+
+
+def valuation_from_price_range(current_price: str, fair_price: str, price_reason: str | None = None) -> str:
+    current = parse_amount(current_price)
+    parts = [parse_amount(part) for part in fair_price.split("~")]
+    if fair_price == FAIR_PRICE_UNAVAILABLE_LABEL or price_reason == "price_outlier":
         return "판단 불가"
     if current is None or len(parts) != 2 or parts[0] is None or parts[1] is None:
         return "보통"
@@ -383,7 +400,7 @@ def build_technical_cache(universe: list[dict[str, str]] | None = None) -> dict[
     except Exception as exc:  # noqa: BLE001 - external market data should not block refresh
         errors.append({"ticker": "CNN_FEAR_GREED", "error": str(exc)})
 
-    for stock in (universe or read_universe())[:50]:
+    for stock in (universe or read_universe())[:MAX_REFRESH_UNIVERSE]:
         try:
             row = latest_technical_row(stock)
             if row:
@@ -413,7 +430,7 @@ def build_valuation_cache(universe: list[dict[str, str]] | None = None) -> dict[
     ]
     rows = read_cache("valuation").get("rows", {})
     errors: list[dict[str, str]] = []
-    for stock in (universe or read_universe())[:50]:
+    for stock in (universe or read_universe())[:MAX_REFRESH_UNIVERSE]:
         try:
             values = fetch_valuation(stock["ticker"])
             metric = dict(zip(columns, values))
@@ -446,6 +463,8 @@ def build_stocks_cache() -> dict[str, Any]:
         fair_price_reason = fair_price_unavailable_reason(valuation)
         fair_price = fair_price_range(stock, valuation)
         current_price = technical.get("currentPrice", "-")
+        price_reason = price_validation_reason(stock, current_price, fair_price)
+        opinion_blocked = fair_price_reason == "loss_making" or price_reason == "price_outlier"
         rows.append({
             "ticker": stock["ticker"],
             "name": stock["name"],
@@ -453,9 +472,10 @@ def build_stocks_cache() -> dict[str, Any]:
             "fairPrice": fair_price,
             "fairPriceReason": fair_price_reason,
             "currentPrice": current_price,
-            "valuation": valuation_from_price_range(current_price, fair_price),
-            "opinion": "-" if fair_price_reason == "loss_making" else technical.get("opinion", "관망"),
-            "strategies": [] if fair_price_reason == "loss_making" else [technical["진입 전략"]] if technical.get("진입 전략") not in (None, "-") else [],
+            "currentPriceReason": price_reason,
+            "valuation": valuation_from_price_range(current_price, fair_price, price_reason),
+            "opinion": "-" if opinion_blocked else technical.get("opinion", "관망"),
+            "strategies": [] if opinion_blocked else [technical["진입 전략"]] if technical.get("진입 전략") not in (None, "-") else [],
             "category": stock_category(stock),
             "industry": stock_industry(stock, valuation),
             "updatedAt": technical.get("updatedAt", now_iso()),
