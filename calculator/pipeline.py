@@ -39,6 +39,7 @@ NEWS_SOURCES = [
 GROQ_CHAT_COMPLETIONS_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_MARKET_TREND_MODEL = "llama-3.3-70b-versatile"
 CNN_FEAR_GREED_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
+FAIR_PRICE_UNAVAILABLE_LABEL = "적자 상태라 판단 불가"
 
 DEFAULT_UNIVERSE = [
     {"ticker": "005930", "name": "삼성전자", "market": "KR"},
@@ -230,10 +231,19 @@ def stock_category(stock: dict[str, Any]) -> str:
     return classify_stock(stock)["category"]
 
 
+def fair_price_unavailable_reason(metric: dict[str, str]) -> str | None:
+    eps = parse_amount(metric.get("epsTtm"))
+    if eps is not None and eps <= 0:
+        return "loss_making"
+    return None
+
+
 def fair_price_range(stock: dict[str, Any], metric: dict[str, str]) -> str:
     category = stock_category(stock)
     eps = parse_amount(metric.get("epsTtm"))
-    if category not in ("가치주", "혼합주", "성장주") or eps is None or eps <= 0:
+    if fair_price_unavailable_reason(metric) == "loss_making":
+        return FAIR_PRICE_UNAVAILABLE_LABEL
+    if category not in ("가치주", "혼합주", "성장주") or eps is None:
         return "-"
 
     if category == "가치주":
@@ -260,6 +270,8 @@ def fair_price_range(stock: dict[str, Any], metric: dict[str, str]) -> str:
 def valuation_from_price_range(current_price: str, fair_price: str) -> str:
     current = parse_amount(current_price)
     parts = [parse_amount(part) for part in fair_price.split("~")]
+    if fair_price == FAIR_PRICE_UNAVAILABLE_LABEL:
+        return "판단 불가"
     if current is None or len(parts) != 2 or parts[0] is None or parts[1] is None:
         return "보통"
     low, high = parts
@@ -431,6 +443,7 @@ def build_stocks_cache() -> dict[str, Any]:
     for stock in read_search_universe():
         technical = technical_rows.get(stock["ticker"], {})
         valuation = valuation_rows.get(stock["ticker"], {})
+        fair_price_reason = fair_price_unavailable_reason(valuation)
         fair_price = fair_price_range(stock, valuation)
         current_price = technical.get("currentPrice", "-")
         rows.append({
@@ -438,10 +451,11 @@ def build_stocks_cache() -> dict[str, Any]:
             "name": stock["name"],
             "market": stock["market"],
             "fairPrice": fair_price,
+            "fairPriceReason": fair_price_reason,
             "currentPrice": current_price,
             "valuation": valuation_from_price_range(current_price, fair_price),
-            "opinion": technical.get("opinion", "관망"),
-            "strategies": [technical["진입 전략"]] if technical.get("진입 전략") not in (None, "-") else [],
+            "opinion": "-" if fair_price_reason == "loss_making" else technical.get("opinion", "관망"),
+            "strategies": [] if fair_price_reason == "loss_making" else [technical["진입 전략"]] if technical.get("진입 전략") not in (None, "-") else [],
             "category": stock_category(stock),
             "industry": stock_industry(stock, valuation),
             "updatedAt": technical.get("updatedAt", now_iso()),

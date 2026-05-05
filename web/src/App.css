@@ -1,10 +1,13 @@
 .app-shell {
+  --page-gutter: clamp(16px, 1.4vw, 32px);
   display: flex;
   flex-direction: column;
   gap: 16px;
+  width: 100%;
+  box-sizing: border-box;
   min-height: 100svh;
   background: var(--bg);
-  padding: 0 20px 20px;
+  padding: 0 var(--page-gutter) 20px;
 }
 
 .panel {
@@ -24,9 +27,9 @@
   grid-template-columns: auto 1fr auto auto auto auto auto;
   gap: 18px;
   align-items: center;
-  width: calc(100% + 40px);
+  width: calc(100% + (var(--page-gutter) * 2));
   box-sizing: border-box;
-  margin: 0 -20px;
+  margin: 0 calc(var(--page-gutter) * -1);
   border: 0;
   border-bottom: 1px solid var(--border);
   border-radius: 0;
@@ -280,9 +283,11 @@
 
 .dashboard-grid {
   display: grid;
-  grid-template-columns: minmax(760px, 1.45fr) minmax(560px, 0.95fr);
+  grid-template-columns: minmax(760px, 1.55fr) minmax(560px, 1fr);
   gap: 16px;
   align-items: stretch;
+  width: 100%;
+  box-sizing: border-box;
 }
 
 .right-column {
@@ -2659,4 +2664,133 @@
   outline: none;
   text-decoration: underline;
   text-underline-offset: 3px;
+}
+
+
+.sort-settings-button {
+  border: 1px solid rgba(34, 136, 238, 0.24);
+  border-radius: 10px;
+  background: var(--accent-soft);
+  color: var(--text-h);
+  cursor: pointer;
+  font: inherit;
+  min-height: 34px;
+  padding: 0 12px;
+}
+
+.sort-settings-button.active,
+.sort-settings-button:hover,
+.sort-settings-button:focus-visible {
+  border-color: rgba(34, 136, 238, 0.48);
+  outline: none;
+}
+
+.watchlist-sort-panel {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) minmax(160px, 220px) minmax(160px, 220px);
+  gap: 12px;
+  align-items: end;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--subtle);
+  padding: 14px;
+}
+
+.watchlist-sort-panel > div,
+.watchlist-sort-panel label {
+  display: grid;
+  gap: 6px;
+}
+
+.watchlist-sort-panel strong {
+  color: var(--text-h);
+}
+
+.watchlist-sort-panel span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.watchlist-sort-panel select {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--input-bg);
+  color: var(--text-h);
+  font: inherit;
+  min-height: 38px;
+  padding: 0 10px;
+}
+
+.unavailable-value-label {
+  color: #b45309;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.admin-logs-panel {
+  min-height: calc(100svh - 104px);
+}
+
+.admin-logs-sheet {
+  flex: 1;
+}
+
+.admin-logs-table {
+  min-width: 760px;
+}
+
+.admin-logs-table td:nth-child(4) {
+  white-space: normal;
+  min-width: 280px;
+}
+
+.account-alert-card {
+  display: grid;
+  gap: 12px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--subtle);
+  padding: 14px;
+}
+
+.account-alert-card > div {
+  display: grid;
+  gap: 4px;
+}
+
+.account-alert-card strong {
+  color: var(--text-h);
+}
+
+.account-alert-card span,
+.account-alert-toggle small {
+  color: var(--muted);
+}
+
+.account-alert-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+
+.account-alert-toggle > span {
+  display: grid;
+  gap: 3px;
+}
+
+.account-alert-toggle input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--accent);
+  flex: none;
+}
+
+@media (max-width: 760px) {
+  .watchlist-sort-panel {
+    grid-template-columns: 1fr;
+  }
 }

@@ -5,9 +5,21 @@ import { fetchAppData, refreshAppData, saveMarketEvents, type AppData, type Runt
 import { isSupabaseConfigured, supabase, userDisplayName } from './supabase'
 
 type Market = 'KR' | 'US'
-type Valuation = '저평가' | '보통' | '고평가'
-type Opinion = '매수' | '관망' | '매도'
+type Valuation = '저평가' | '보통' | '고평가' | '판단 불가'
+type Opinion = '매수' | '관망' | '매도' | '-'
 type TradeStatus = '익절' | '손절' | '실패 익절' | '보유 중'
+type WatchlistSortKey = 'registered' | 'market_kr_first' | 'market_us_first' | 'holding_first' | 'not_holding_first' | 'valuation_low_first' | 'valuation_high_first' | 'opinion_buy_first' | 'opinion_sell_first' | 'name_asc' | 'name_desc'
+
+type WatchlistSortSettings = {
+  primary: WatchlistSortKey
+  secondary: WatchlistSortKey
+}
+
+type NotificationPreferences = {
+  opinionChangeEmail: boolean
+  weeklyTrendReport: boolean
+  earningsDayBefore: boolean
+}
 
 type Stock = {
   ticker: string
@@ -20,6 +32,7 @@ type Stock = {
   strategies: string[]
   category?: string
   industry?: string
+  fairPriceReason?: 'loss_making'
   updatedAt: string
 }
 
@@ -41,7 +54,7 @@ type TooltipState = {
   y: number
 }
 
-type ActivePage = 'home' | 'value-analysis' | 'technical-analysis' | 'market-events' | 'market-trends' | 'board'
+type ActivePage = 'home' | 'value-analysis' | 'technical-analysis' | 'market-events' | 'market-trends' | 'board' | 'admin-logs'
 
 type AuthMode = 'login' | 'signup' | 'recover' | 'reset'
 type BoardCategory = '칭찬' | '버그' | '건의' | '기타'
@@ -92,6 +105,16 @@ type BoardPost = {
   hidden?: boolean
 }
 
+type ApiLog = {
+  id: string
+  triggerName: string
+  status: 'success' | 'failure'
+  message: string
+  createdAt: string
+  actorEmail?: string
+  metadata?: Record<string, unknown>
+}
+
 type ValuationMetric = {
   marketCap: string
   sales: string
@@ -121,8 +144,16 @@ const WATCHLIST_STORAGE_KEY = 'gongsu-watchlist'
 const OPERATOR_WATCHLIST_STORAGE_KEY = 'gongsu-operator-watchlist'
 const VIEW_MODE_STORAGE_KEY = 'gongsu-view-mode'
 const VIEW_MODE_HINT_STORAGE_KEY = 'gongsu-view-mode-hint-seen'
+const USER_SETTINGS_STORAGE_KEY = 'gongsu-user-settings'
+const API_LOGS_STORAGE_KEY = 'gongsu-api-logs'
 const DEFAULT_ADMIN_EMAILS = ['admin@gongsu.local']
-const IS_DEV_MODE = import.meta.env.DEV
+const FAIR_PRICE_UNAVAILABLE_LABEL = '적자 상태라 판단 불가'
+const DEFAULT_WATCHLIST_SORT: WatchlistSortSettings = { primary: 'registered', secondary: 'registered' }
+const DEFAULT_NOTIFICATION_PREFERENCES: NotificationPreferences = {
+  opinionChangeEmail: true,
+  weeklyTrendReport: true,
+  earningsDayBefore: true,
+}
 const TEST_USER_SESSION: UserSession = {
   id: 'local-test-user',
   email: 'test@gongsu.local',
@@ -174,6 +205,104 @@ function readStoredOperatorWatchlist() {
 
 function readStoredViewMode() {
   return localStorage.getItem(VIEW_MODE_STORAGE_KEY) === 'operator' ? 'operator' : 'personal'
+}
+
+function userSettingsStorageKey(session: UserSession | null = null) {
+  return `${USER_SETTINGS_STORAGE_KEY}:${session?.email.toLowerCase() ?? 'guest'}`
+}
+
+function normalizeWatchlistSortSettings(value: unknown): WatchlistSortSettings {
+  const allowed: WatchlistSortKey[] = [
+    'registered',
+    'market_kr_first',
+    'market_us_first',
+    'holding_first',
+    'not_holding_first',
+    'valuation_low_first',
+    'valuation_high_first',
+    'opinion_buy_first',
+    'opinion_sell_first',
+    'name_asc',
+    'name_desc',
+  ]
+  const candidate = value as Partial<WatchlistSortSettings> | null
+  const primary = candidate && allowed.includes(candidate.primary as WatchlistSortKey) ? candidate.primary as WatchlistSortKey : DEFAULT_WATCHLIST_SORT.primary
+  const secondary = candidate && allowed.includes(candidate.secondary as WatchlistSortKey) ? candidate.secondary as WatchlistSortKey : DEFAULT_WATCHLIST_SORT.secondary
+  return { primary, secondary }
+}
+
+function normalizeNotificationPreferences(value: unknown): NotificationPreferences {
+  const candidate = value as Partial<NotificationPreferences> | null
+  return {
+    opinionChangeEmail: typeof candidate?.opinionChangeEmail === 'boolean' ? candidate.opinionChangeEmail : DEFAULT_NOTIFICATION_PREFERENCES.opinionChangeEmail,
+    weeklyTrendReport: typeof candidate?.weeklyTrendReport === 'boolean' ? candidate.weeklyTrendReport : DEFAULT_NOTIFICATION_PREFERENCES.weeklyTrendReport,
+    earningsDayBefore: typeof candidate?.earningsDayBefore === 'boolean' ? candidate.earningsDayBefore : DEFAULT_NOTIFICATION_PREFERENCES.earningsDayBefore,
+  }
+}
+
+function readStoredUserSettings(session: UserSession | null = null) {
+  const stored = localStorage.getItem(userSettingsStorageKey(session)) ?? localStorage.getItem(USER_SETTINGS_STORAGE_KEY)
+  if (!stored) {
+    return { watchlistSort: DEFAULT_WATCHLIST_SORT, notificationPreferences: DEFAULT_NOTIFICATION_PREFERENCES }
+  }
+
+  try {
+    const parsed = JSON.parse(stored)
+    return {
+      watchlistSort: normalizeWatchlistSortSettings(parsed.watchlistSort),
+      notificationPreferences: normalizeNotificationPreferences(parsed.notificationPreferences),
+    }
+  } catch {
+    localStorage.removeItem(userSettingsStorageKey(session))
+    return { watchlistSort: DEFAULT_WATCHLIST_SORT, notificationPreferences: DEFAULT_NOTIFICATION_PREFERENCES }
+  }
+}
+
+function storeUserSettings(
+  session: UserSession | null,
+  watchlistSort: WatchlistSortSettings,
+  notificationPreferences: NotificationPreferences,
+) {
+  localStorage.setItem(userSettingsStorageKey(session), JSON.stringify({ watchlistSort, notificationPreferences }))
+}
+
+function readStoredApiLogs() {
+  const stored = localStorage.getItem(API_LOGS_STORAGE_KEY)
+  if (!stored) return []
+  try {
+    const parsed = JSON.parse(stored)
+    return Array.isArray(parsed) ? parsed.filter((row): row is ApiLog => typeof row?.id === 'string') : []
+  } catch {
+    localStorage.removeItem(API_LOGS_STORAGE_KEY)
+    return []
+  }
+}
+
+function storeApiLogs(logs: ApiLog[]) {
+  const cutoff = Date.now() - 21 * 24 * 60 * 60 * 1000
+  localStorage.setItem(API_LOGS_STORAGE_KEY, JSON.stringify(
+    logs.filter((log) => new Date(log.createdAt).getTime() >= cutoff).slice(0, 200),
+  ))
+}
+
+function mapApiLog(row: {
+  id: string
+  trigger_name: string
+  status: string
+  message: string | null
+  created_at: string
+  metadata: Record<string, unknown> | null
+  profiles?: { email?: string | null } | null
+}): ApiLog {
+  return {
+    id: row.id,
+    triggerName: row.trigger_name,
+    status: row.status === 'failure' ? 'failure' : 'success',
+    message: row.message ?? '',
+    createdAt: row.created_at,
+    actorEmail: row.profiles?.email ?? undefined,
+    metadata: row.metadata ?? {},
+  }
 }
 
 function sessionFromSupabaseUser(user: User): UserSession {
@@ -900,6 +1029,70 @@ function isSystemHolding(ticker: string, targetTrades: TradeLog[]) {
   return targetTrades.some((trade) => trade.ticker === ticker && trade.status === '보유 중')
 }
 
+function isFairPriceUnavailable(stock: Stock) {
+  return stock.fairPriceReason === 'loss_making' || stock.fairPrice === FAIR_PRICE_UNAVAILABLE_LABEL
+}
+
+function displayFairPriceText(stock: Stock) {
+  return isFairPriceUnavailable(stock) ? FAIR_PRICE_UNAVAILABLE_LABEL : stock.fairPrice
+}
+
+function displayStockOpinion(stock: Stock): Opinion {
+  return isFairPriceUnavailable(stock) ? '-' : stock.opinion
+}
+
+function displayStockValuation(stock: Stock): Valuation {
+  if (isFairPriceUnavailable(stock)) return '판단 불가'
+  return valuationFromPriceRange(stock.currentPrice, stock.fairPrice) ?? stock.valuation
+}
+
+function compareValues(a: number | string, b: number | string) {
+  if (typeof a === 'number' && typeof b === 'number') return a - b
+  return String(a).localeCompare(String(b), ['ko', 'en'])
+}
+
+function valuationRank(stock: Stock) {
+  const value = displayStockValuation(stock)
+  if (value === '저평가') return 0
+  if (value === '보통') return 1
+  if (value === '고평가') return 2
+  return 3
+}
+
+function opinionRank(stock: Stock) {
+  const value = displayStockOpinion(stock)
+  if (value === '매수') return 0
+  if (value === '관망') return 1
+  if (value === '매도') return 2
+  return 3
+}
+
+function compareByWatchlistSortKey(key: WatchlistSortKey, a: Stock, b: Stock, trades: TradeLog[]) {
+  if (key === 'registered') return 0
+  if (key === 'market_kr_first') return compareValues(a.market === 'KR' ? 0 : 1, b.market === 'KR' ? 0 : 1)
+  if (key === 'market_us_first') return compareValues(a.market === 'US' ? 0 : 1, b.market === 'US' ? 0 : 1)
+  if (key === 'holding_first') return compareValues(isSystemHolding(a.ticker, trades) ? 0 : 1, isSystemHolding(b.ticker, trades) ? 0 : 1)
+  if (key === 'not_holding_first') return compareValues(isSystemHolding(a.ticker, trades) ? 1 : 0, isSystemHolding(b.ticker, trades) ? 1 : 0)
+  if (key === 'valuation_low_first') return compareValues(valuationRank(a), valuationRank(b))
+  if (key === 'valuation_high_first') return compareValues(valuationRank(b), valuationRank(a))
+  if (key === 'opinion_buy_first') return compareValues(opinionRank(a), opinionRank(b))
+  if (key === 'opinion_sell_first') return compareValues(opinionRank(b), opinionRank(a))
+  if (key === 'name_asc') return compareValues(a.name, b.name)
+  if (key === 'name_desc') return compareValues(b.name, a.name)
+  return 0
+}
+
+function sortWatchlistStocks(stocks: Stock[], settings: WatchlistSortSettings, tickers: string[], trades: TradeLog[]) {
+  const registeredOrder = new Map(tickers.map((ticker, index) => [ticker, index]))
+  return stocks.slice().sort((a, b) => {
+    const primary = compareByWatchlistSortKey(settings.primary, a, b, trades)
+    if (primary !== 0) return primary
+    const secondary = compareByWatchlistSortKey(settings.secondary, a, b, trades)
+    if (secondary !== 0) return secondary
+    return (registeredOrder.get(a.ticker) ?? 0) - (registeredOrder.get(b.ticker) ?? 0)
+  })
+}
+
 function stockName(ticker: string) {
   return searchUniverse.find((stock) => stock.ticker === ticker)?.name ?? ticker
 }
@@ -1066,9 +1259,27 @@ function isSameTrendWeek(tradeDate: string, trendDate: string) {
 }
 
 const gnbMenus = ['HOME', '가치 분석', '기술 분석', '시장 주요 이벤트', '시장 트렌드']
-const adminGnbMenus = [...gnbMenus, '게시판']
+const adminGnbMenus = [...gnbMenus, '운영 로그', '게시판']
 const boardCategories: BoardCategory[] = ['칭찬', '버그', '건의', '기타']
 const boardFilters: BoardFilter[] = ['전체', ...boardCategories]
+const watchlistSortOptions: Array<{ value: WatchlistSortKey; label: string }> = [
+  { value: 'registered', label: '등록순' },
+  { value: 'market_kr_first', label: '한국 종목 먼저' },
+  { value: 'market_us_first', label: '미국 종목 먼저' },
+  { value: 'holding_first', label: '보유 중 먼저' },
+  { value: 'not_holding_first', label: '미보유 먼저' },
+  { value: 'valuation_low_first', label: '저평가 먼저' },
+  { value: 'valuation_high_first', label: '고평가 먼저' },
+  { value: 'opinion_buy_first', label: '매수 의견 먼저' },
+  { value: 'opinion_sell_first', label: '매도 의견 먼저' },
+  { value: 'name_asc', label: '종목명 가나다/A-Z' },
+  { value: 'name_desc', label: '종목명 역순' },
+]
+const notificationOptions: Array<{ key: keyof NotificationPreferences; title: string; description: string }> = [
+  { key: 'opinionChangeEmail', title: '투자의견 변경 시 메일 받기', description: '관심종목의 매수/관망/매도 신호가 바뀌면 알려줍니다.' },
+  { key: 'weeklyTrendReport', title: '트렌드 리포트 받기 (주 1회)', description: '시장 트렌드 상위 섹터와 관심종목 연관 흐름을 주간으로 봅니다.' },
+  { key: 'earningsDayBefore', title: '실적발표 전날 알람 받기', description: '관심종목 실적발표 전날 리스크 점검 알림을 받습니다.' },
+]
 
 const initialBoardPosts: BoardPost[] = []
 
@@ -1635,7 +1846,7 @@ function ValueAnalysisPage({
           <tbody>
             {visibleStocks.map((stock) => {
               const metric = valuationRows[stock.ticker]
-              const displayValuation = valuationFromPriceRange(stock.currentPrice, stock.fairPrice) ?? stock.valuation
+              const displayValuation = displayStockValuation(stock)
 
               return (
                 <tr key={stock.ticker}>
@@ -1648,7 +1859,7 @@ function ValueAnalysisPage({
                   <td className="ticker-cell">{stock.ticker}</td>
                   <td>{stock.category ?? (stock.market === 'KR' ? '성장주' : '혼합주')}</td>
                   <td className="industry-cell">{stock.industry ?? '-'}</td>
-                  <td className="number-cell">{stock.fairPrice}</td>
+                  <td className="number-cell">{isFairPriceUnavailable(stock) ? <span className="unavailable-value-label">{displayFairPriceText(stock)}</span> : displayFairPriceText(stock)}</td>
                   <td className="number-cell">{stock.currentPrice}</td>
                   <td><span className={`status-badge ${valuationBadgeClass(displayValuation)}`}>{displayValuation}</span></td>
                   {valueMetricColumns.map((column) => (
@@ -1789,7 +2000,7 @@ function TechnicalAnalysisPage({
                     </div>
                   </td>
                   <td className="ticker-cell">{stock.ticker}</td>
-                  <td><span className={`status-badge ${statusClass(stock.opinion)}`}>{stock.opinion}</span></td>
+                  <td><span className={`status-badge ${statusClass(displayStockOpinion(stock))}`}>{displayStockOpinion(stock)}</span></td>
                   {technicalMetricColumns.map((column) => {
                     const value = apiRow?.[column.label] ?? '-'
                     const isEntryStrategy = column.label === '진입 전략'
@@ -2154,6 +2365,60 @@ function maskBoardAuthorName(value: string) {
   return `${value.slice(0, 2)}******`
 }
 
+function AdminLogsPage({
+  logs,
+  isLoading,
+  onRefresh,
+}: {
+  logs: ApiLog[]
+  isLoading: boolean
+  onRefresh: () => void
+}) {
+  return (
+    <section className="panel board-panel admin-logs-panel">
+      <div className="section-heading value-analysis-heading">
+        <div>
+          <h2>운영 로그</h2>
+          <p>즉시 갱신, 시장 이벤트 저장처럼 운영자가 누른 트리거의 성공/실패를 최근 3주 기준으로 확인합니다.</p>
+        </div>
+        <button className="refresh-data-button" disabled={isLoading} type="button" onClick={onRefresh}>
+          {isLoading ? '불러오는 중' : '새로고침'}
+        </button>
+      </div>
+
+      <div className="sheet-wrap admin-logs-sheet">
+        {logs.length === 0 ? (
+          <div className="board-empty-state">
+            <strong>아직 기록된 운영 로그가 없습니다.</strong>
+            <span>관리자 트리거를 실행하면 성공/실패 여부가 이곳에 쌓입니다.</span>
+          </div>
+        ) : (
+          <table className="sheet-table admin-logs-table">
+            <thead>
+              <tr>
+                <th>시간</th>
+                <th>트리거</th>
+                <th>결과</th>
+                <th>메시지</th>
+              </tr>
+            </thead>
+            <tbody>
+              {logs.map((log) => (
+                <tr key={log.id}>
+                  <td>{formatBoardPostDate(log.createdAt)}</td>
+                  <td>{log.triggerName}</td>
+                  <td><span className={`status-badge ${log.status === 'success' ? 'positive' : 'negative'}`}>{log.status === 'success' ? '성공' : '실패'}</span></td>
+                  <td>{log.message || '-'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </section>
+  )
+}
+
 function BoardPage({
   posts,
   category,
@@ -2410,6 +2675,7 @@ function App() {
   const [selectedBoardPostIds, setSelectedBoardPostIds] = useState<string[]>([])
   const [pendingBoardDeleteIds, setPendingBoardDeleteIds] = useState<string[]>([])
   const [userSession, setUserSession] = useState<UserSession | null>(null)
+  const [canUseAccountSwitch, setCanUseAccountSwitch] = useState(false)
   const [authInfoMessage, setAuthInfoMessage] = useState('')
   const [isRemoteDataReady, setIsRemoteDataReady] = useState(!isSupabaseConfigured)
   const [apiStocks, setApiStocks] = useState<Stock[]>(() => searchUniverse.map(stockSearchShell))
@@ -2425,6 +2691,11 @@ function App() {
   const [isMarketEventsDirty, setIsMarketEventsDirty] = useState(false)
   const [isRefreshingData, setIsRefreshingData] = useState(false)
   const [refreshDataMessage, setRefreshDataMessage] = useState('')
+  const [watchlistSortSettings, setWatchlistSortSettings] = useState<WatchlistSortSettings>(() => readStoredUserSettings().watchlistSort)
+  const [notificationPreferences, setNotificationPreferences] = useState<NotificationPreferences>(() => readStoredUserSettings().notificationPreferences)
+  const [isWatchlistSortOpen, setIsWatchlistSortOpen] = useState(false)
+  const [apiLogs, setApiLogs] = useState<ApiLog[]>(() => readStoredApiLogs())
+  const [isLoadingApiLogs, setIsLoadingApiLogs] = useState(false)
   const [activePage, setActivePage] = useState<ActivePage>('home')
   const addStockButtonRef = useRef<HTMLButtonElement | null>(null)
   const inlineAddRef = useRef<HTMLDivElement | null>(null)
@@ -2469,6 +2740,114 @@ function App() {
         email: session.email,
         name: session.name,
       })
+
+    try {
+      await supabase
+        .from('user_settings')
+        .upsert({ owner_id: session.id })
+    } catch {
+      // The follow-up migration may not be applied in older live environments yet.
+    }
+  }
+
+  async function loadUserSettings(session: UserSession | null) {
+    if (!session || !supabase) return readStoredUserSettings(session)
+
+    const { data, error } = await supabase
+      .from('user_settings')
+      .select('watchlist_sort, notification_preferences')
+      .eq('owner_id', session.id)
+      .maybeSingle()
+
+    if (error) return readStoredUserSettings(session)
+    const nextSettings = {
+      watchlistSort: normalizeWatchlistSortSettings(data?.watchlist_sort),
+      notificationPreferences: normalizeNotificationPreferences(data?.notification_preferences),
+    }
+    storeUserSettings(session, nextSettings.watchlistSort, nextSettings.notificationPreferences)
+    return nextSettings
+  }
+
+  async function persistUserSettings(
+    watchlistSort: WatchlistSortSettings,
+    notificationPreferences: NotificationPreferences,
+    session = userSession,
+  ) {
+    storeUserSettings(session, watchlistSort, notificationPreferences)
+    if (!supabase || !session) return
+
+    try {
+      await supabase
+        .from('user_settings')
+        .upsert({
+          owner_id: session.id,
+          watchlist_sort: watchlistSort,
+          notification_preferences: notificationPreferences,
+        })
+    } catch {
+      // Local storage already has the latest value.
+    }
+  }
+
+  async function loadApiLogs() {
+    if (!userSession || !configuredAdminEmails().includes(userSession.email.toLowerCase())) return
+    setIsLoadingApiLogs(true)
+    const cutoff = new Date(Date.now() - 21 * 24 * 60 * 60 * 1000).toISOString()
+    try {
+      if (!supabase) {
+        const logs = readStoredApiLogs().filter((log) => log.createdAt >= cutoff)
+        setApiLogs(logs)
+        storeApiLogs(logs)
+        return
+      }
+
+      await supabase.from('api_logs').delete().lt('created_at', cutoff)
+      const { data, error } = await supabase
+        .from('api_logs')
+        .select('id, trigger_name, status, message, metadata, created_at')
+        .gte('created_at', cutoff)
+        .order('created_at', { ascending: false })
+        .limit(200)
+      if (error) throw error
+      setApiLogs((data ?? []).map(mapApiLog))
+    } catch {
+      const logs = readStoredApiLogs().filter((log) => log.createdAt >= cutoff)
+      setApiLogs(logs)
+    } finally {
+      setIsLoadingApiLogs(false)
+    }
+  }
+
+  async function recordApiLog(triggerName: string, status: 'success' | 'failure', message: string, metadata: Record<string, unknown> = {}) {
+    const nextLog: ApiLog = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      triggerName,
+      status,
+      message,
+      metadata,
+      createdAt: new Date().toISOString(),
+      actorEmail: userSession?.email,
+    }
+    setApiLogs((current) => {
+      const next = [nextLog, ...current].slice(0, 200)
+      if (!supabase) storeApiLogs(next)
+      return next
+    })
+
+    if (!supabase || !userSession) return
+    try {
+      await supabase
+        .from('api_logs')
+        .insert({
+          actor_id: userSession.id,
+          trigger_name: triggerName,
+          status,
+          message,
+          metadata,
+        })
+    } catch {
+      // The in-memory log is still shown to the admin for this session.
+    }
   }
 
   async function loadWatchlist(scope: 'personal' | 'operator', session: UserSession | null) {
@@ -2544,10 +2923,13 @@ function App() {
   async function loadServiceData(session: UserSession | null) {
     setIsRemoteDataReady(false)
     try {
-      const [personalTickers, operatorTickersFromDb] = await Promise.all([
+      const [personalTickers, operatorTickersFromDb, loadedSettings] = await Promise.all([
         session ? loadWatchlist('personal', session) : Promise.resolve(null),
         loadWatchlist('operator', session),
+        loadUserSettings(session),
       ])
+      setWatchlistSortSettings(loadedSettings.watchlistSort)
+      setNotificationPreferences(loadedSettings.notificationPreferences)
       await loadBoardPosts()
       const legacyTickers = session ? readLegacyWatchlist(session) : null
       const nextPersonalTickers = personalTickers && personalTickers.length > 0
@@ -2591,6 +2973,7 @@ function App() {
       if (!isMounted) return
       if (!user) {
         setUserSession(null)
+        setCanUseAccountSwitch(false)
         setWatchlist(readStoredWatchlist(null))
         setBoardPosts([])
         await loadServiceData(null)
@@ -2676,6 +3059,14 @@ function App() {
 
   const trimmedLoginEmail = loginEmail.trim().toLowerCase()
   const isAdminUser = userSession ? configuredAdminEmails().includes(userSession.email.toLowerCase()) : false
+
+  useEffect(() => {
+    if (isAdminUser) {
+      setCanUseAccountSwitch(true)
+      void loadApiLogs()
+    }
+  }, [isAdminUser, userSession?.id])
+
   const effectiveViewMode = isAdminUser ? 'operator' : viewMode
   const isOperatorDataMode = effectiveViewMode === 'operator'
   const scopedTrades = isOperatorDataMode ? operatorTrades : personalTradeLogs
@@ -2696,7 +3087,7 @@ function App() {
   const strategyCriteriaLine = 'A/B/C(+20% 즉시, -30%), D(+12%, -25%, 최대 30일), E/F(+20% 후 MACD 둔화·5일 대기, -30%)'
   const investingDays = daysFromFirstTrade(scopedTrades)
   const visibleGnbMenus = isAdminUser ? adminGnbMenus : gnbMenus
-  const currentActivePage = !isAdminUser && activePage === 'board' ? 'home' : activePage
+  const currentActivePage = !isAdminUser && (activePage === 'board' || activePage === 'admin-logs') ? 'home' : activePage
   const isLoginEmailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmedLoginEmail)
   const shouldShowEmailValidation = loginEmail.trim().length > 0 && !isLoginEmailValid
   const shouldShowPasswordValidation = loginPassword.trim().length > 0 && loginPassword.trim().length < 8
@@ -2951,6 +3342,7 @@ function App() {
   const logout = async () => {
     await supabase?.auth.signOut()
     setUserSession(null)
+    setCanUseAccountSwitch(false)
     setWatchlist(readStoredWatchlist(null))
     setSelectedTickers([])
     setSelectedHoldingTradeKeys([])
@@ -2980,6 +3372,7 @@ function App() {
         }
 
     setUserSession(nextSession)
+    setCanUseAccountSwitch(true)
     setWatchlist(readStoredWatchlist(nextSession))
     setSelectedTickers([])
     setSelectedHoldingTradeKeys([])
@@ -3030,6 +3423,18 @@ function App() {
     setIsMarketEventsDirty(true)
   }
 
+  const updateWatchlistSortSetting = (field: keyof WatchlistSortSettings, value: WatchlistSortKey) => {
+    const nextSort = { ...watchlistSortSettings, [field]: value }
+    setWatchlistSortSettings(nextSort)
+    void persistUserSettings(nextSort, notificationPreferences)
+  }
+
+  const updateNotificationPreference = (key: keyof NotificationPreferences, value: boolean) => {
+    const nextPreferences = { ...notificationPreferences, [key]: value }
+    setNotificationPreferences(nextPreferences)
+    void persistUserSettings(watchlistSortSettings, nextPreferences)
+  }
+
   const saveMarketEventEntries = async () => {
     if (!isAdminUser || !isMarketEventsDirty) return
     const normalizedGroups = normalizeMarketEventDdays(apiMarketEventGroups)
@@ -3048,6 +3453,9 @@ function App() {
         setMarketEventMonths(saved.months)
       }
       setIsMarketEventsDirty(false)
+      await recordApiLog('market-events', 'success', '시장 주요 이벤트를 저장했습니다.', { groups: normalizedGroups.length })
+    } catch (error) {
+      await recordApiLog('market-events', 'failure', error instanceof Error ? error.message : '시장 주요 이벤트 저장에 실패했습니다.')
     } finally {
       setIsSavingMarketEvents(false)
     }
@@ -3069,8 +3477,10 @@ function App() {
       const data = await fetchAppData<Stock, ValuationMetric, MarketEventGroup, MarketTrendRow>()
       applyLoadedData(data)
       setRefreshDataMessage(`${result.refreshedTickers.length}개 종목을 현재 시점 기준으로 갱신했습니다.`)
-    } catch {
+      await recordApiLog('refresh-data', 'success', `${result.refreshedTickers.length}개 종목을 갱신했습니다.`, { tickers: result.refreshedTickers })
+    } catch (error) {
       setRefreshDataMessage('즉시 갱신에 실패했습니다. 로컬 API 서버를 켠 뒤 다시 시도해 주세요.')
+      await recordApiLog('refresh-data', 'failure', error instanceof Error ? error.message : '데이터 즉시 갱신에 실패했습니다.', { tickers })
     } finally {
       setIsRefreshingData(false)
     }
@@ -3159,9 +3569,13 @@ function App() {
     setBoardPage(1)
   }
 
-  const tableStocks = isOperatorDataMode ? operatorStocks : watchlistStocks
-  const canEditCurrentWatchlist = effectiveViewMode === 'personal' || isAdminUser
   const currentWatchlistTickers = isOperatorDataMode ? operatorWatchlist : watchlist
+  const rawTableStocks = isOperatorDataMode ? operatorStocks : watchlistStocks
+  const tableStocks = useMemo(
+    () => sortWatchlistStocks(rawTableStocks, watchlistSortSettings, currentWatchlistTickers, scopedTrades),
+    [currentWatchlistTickers, rawTableStocks, scopedTrades, watchlistSortSettings],
+  )
+  const canEditCurrentWatchlist = effectiveViewMode === 'personal' || isAdminUser
   const isCurrentWatchlistEmpty = tableStocks.length === 0
   const isCurrentWatchlistFull = canEditCurrentWatchlist && currentWatchlistTickers.length >= MAX_WATCHLIST_ITEMS
   const megaTrendStatus = (trade: TradeLog) => {
@@ -3234,7 +3648,7 @@ function App() {
         </div>
         <nav className="gnb-menu" aria-label="주요 메뉴">
           {visibleGnbMenus.map((menu) => {
-            const isActive = (menu === 'HOME' && currentActivePage === 'home') || (menu === '가치 분석' && currentActivePage === 'value-analysis') || (menu === '기술 분석' && currentActivePage === 'technical-analysis') || (menu === '시장 주요 이벤트' && currentActivePage === 'market-events') || (menu === '시장 트렌드' && currentActivePage === 'market-trends') || (menu === '게시판' && currentActivePage === 'board')
+            const isActive = (menu === 'HOME' && currentActivePage === 'home') || (menu === '가치 분석' && currentActivePage === 'value-analysis') || (menu === '기술 분석' && currentActivePage === 'technical-analysis') || (menu === '시장 주요 이벤트' && currentActivePage === 'market-events') || (menu === '시장 트렌드' && currentActivePage === 'market-trends') || (menu === '운영 로그' && currentActivePage === 'admin-logs') || (menu === '게시판' && currentActivePage === 'board')
 
             return (
               <button
@@ -3247,6 +3661,7 @@ function App() {
                   if (menu === '기술 분석') setActivePage('technical-analysis')
                   if (menu === '시장 주요 이벤트') setActivePage('market-events')
                   if (menu === '시장 트렌드') setActivePage('market-trends')
+                  if (menu === '운영 로그') setActivePage('admin-logs')
                   if (menu === '게시판') setActivePage('board')
                 }}
               >
@@ -3489,10 +3904,43 @@ function App() {
                     공수성가 기준
                   </button>
                 )}
+                <button
+                  aria-expanded={isWatchlistSortOpen}
+                  aria-label="관심 종목 정렬 설정"
+                  className={`sort-settings-button ${isWatchlistSortOpen ? 'active' : ''}`}
+                  type="button"
+                  onClick={() => setIsWatchlistSortOpen((current) => !current)}
+                >
+                  상세 설정
+                </button>
               </div>
             </div>
 
             {addStockInlineControl}
+            {isWatchlistSortOpen && (
+              <div className="watchlist-sort-panel">
+                <div>
+                  <strong>정렬 순서</strong>
+                  <span>계정별로 저장됩니다. 1순위가 같으면 2순위, 그 다음 등록순으로 정렬합니다.</span>
+                </div>
+                <label>
+                  <span>1순위</span>
+                  <select value={watchlistSortSettings.primary} onChange={(event) => updateWatchlistSortSetting('primary', event.target.value as WatchlistSortKey)}>
+                    {watchlistSortOptions.map((option) => (
+                      <option key={option.value} value={option.value}>{option.label}</option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  <span>2순위</span>
+                  <select value={watchlistSortSettings.secondary} onChange={(event) => updateWatchlistSortSetting('secondary', event.target.value as WatchlistSortKey)}>
+                    {watchlistSortOptions.map((option) => (
+                      <option key={option.value} value={option.value}>{option.label}</option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+            )}
 
             <div className="sheet-wrap watchlist-sheet">
               {tableStocks.length === 0 ? (
@@ -3528,7 +3976,8 @@ function App() {
                   </thead>
                   <tbody>
                     {tableStocks.map((stock, index) => {
-                      const displayValuation = valuationFromPriceRange(stock.currentPrice, stock.fairPrice) ?? stock.valuation
+                      const displayValuation = displayStockValuation(stock)
+                      const displayOpinion = displayStockOpinion(stock)
 
                       return (
                       <tr key={stock.ticker}>
@@ -3556,7 +4005,9 @@ function App() {
                         <td className="number-cell">
                           {isPendingValue(stock.fairPrice) ? (
                             <span className="pending-update-label">{fairPricePendingLabel}</span>
-                          ) : stock.fairPrice}
+                          ) : isFairPriceUnavailable(stock) ? (
+                            <span className="unavailable-value-label">{displayFairPriceText(stock)}</span>
+                          ) : displayFairPriceText(stock)}
                         </td>
                         <td className="number-cell">
                           {isPendingValue(stock.currentPrice) ? (
@@ -3564,7 +4015,7 @@ function App() {
                           ) : stock.currentPrice}
                         </td>
                         <td><span className={`status-badge ${valuationBadgeClass(displayValuation)}`}>{displayValuation}</span></td>
-                        <td><span className={`status-badge ${statusClass(stock.opinion)}`}>{stock.opinion}</span></td>
+                        <td><span className={`status-badge ${statusClass(displayOpinion)}`}>{displayOpinion}</span></td>
                         <td>
                           {isSystemHolding(stock.ticker, scopedTrades) ? '보유 중' : '미보유'}
                         </td>
@@ -3730,6 +4181,8 @@ function App() {
         />
       ) : currentActivePage === 'market-trends' ? (
         <MarketTrendsPage rows={apiMarketTrendRows} />
+      ) : currentActivePage === 'admin-logs' && isAdminUser ? (
+        <AdminLogsPage logs={apiLogs} isLoading={isLoadingApiLogs} onRefresh={loadApiLogs} />
       ) : currentActivePage === 'board' && isAdminUser ? (
         <BoardPage
           category={boardCategory}
@@ -3800,7 +4253,26 @@ function App() {
                   <span>로그인 계정</span>
                   <strong>{userSession.email}</strong>
                 </div>
-                {IS_DEV_MODE && (
+                <div className="account-alert-card">
+                  <div>
+                    <strong>알림 설정</strong>
+                    <span>현재는 계정별 수신 설정을 저장합니다. 실제 메일 발송은 운영 메일러 연결 후 활성화됩니다.</span>
+                  </div>
+                  {notificationOptions.map((option) => (
+                    <label className="account-alert-toggle" key={option.key}>
+                      <span>
+                        <strong>{option.title}</strong>
+                        <small>{option.description}</small>
+                      </span>
+                      <input
+                        checked={notificationPreferences[option.key]}
+                        type="checkbox"
+                        onChange={(event) => updateNotificationPreference(option.key, event.target.checked)}
+                      />
+                    </label>
+                  ))}
+                </div>
+                {canUseAccountSwitch && (
                   <div className="account-bypass-card">
                     <span>테스트 전환</span>
                     <div className="account-bypass-actions">
